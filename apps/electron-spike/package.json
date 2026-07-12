@@ -1,0 +1,41 @@
+{
+  "name": "opensnaptracker-electron-spike",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/main.js",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.json",
+    "start": "npm run build && electron .",
+    "start:x11": "npm run build && env XDG_SESSION_TYPE=x11 electron . --ozone-platform=x11 --force-device-scale-factor=1",
+    "package:appimage": "npm run build && electron-builder --linux AppImage"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "electron": "^40.0.0",
+    "electron-builder": "^26.0.12",
+    "typescript": "^5.9.0"
+  },
+  "build": {
+    "appId": "dev.opensnaptracker.electron-spike",
+    "productName": "OpenSnapTracker Electron Spike",
+    "files": [
+      "dist/**/*",
+      "src/index.html",
+      "src/styles.css",
+      "package.json"
+    ],
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Game"
+    },
+    "appImage": {
+      "executableArgs": [
+        "--ozone-platform=x11",
+        "--force-device-scale-factor=1"
+      ]
+    }
+  }
+}

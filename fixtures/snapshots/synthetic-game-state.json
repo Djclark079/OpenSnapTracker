@@ -1,0 +1,8 @@
+{
+  "RemoteGame": {
+    "GameState": {
+      "SyntheticFixture": true
+    }
+  },
+  "note": "Synthetic fixture only. Do not infer Marvel Snap schema from this file."
+}

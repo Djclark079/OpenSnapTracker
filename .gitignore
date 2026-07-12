@@ -1,0 +1,10 @@
+/target/
+**/target/
+**/node_modules/
+**/dist/
+apps/tauri-spike/src-tauri/gen/
+captures/
+Exiled-Exchange-2-master.zip
+helper-for-marvel-snap-master.zip
+*.log
+.DS_Store

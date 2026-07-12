@@ -1,0 +1,89 @@
+html,
+body,
+#app {
+  margin: 0;
+  height: 100%;
+  background: transparent;
+  color: #f7f4ff;
+  font-family: system-ui, sans-serif;
+  user-select: none;
+}
+
+.overlay {
+  box-sizing: border-box;
+  height: 100vh;
+  width: 100vw;
+  border: 1px solid rgba(160, 128, 255, 0.55);
+  background: rgba(10, 9, 22, 0.78);
+  display: grid;
+  grid-template-rows: 34px 1fr 38px;
+  overflow: hidden;
+}
+
+header,
+footer {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+strong {
+  flex: 1;
+  font-size: 14px;
+}
+
+button {
+  border: 0;
+  color: inherit;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+}
+
+.grid {
+  padding: 8px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(44px, 1fr));
+  gap: 6px;
+  overflow-y: auto;
+}
+
+.card {
+  min-height: 68px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  background: linear-gradient(150deg, #244a69, #7b3359);
+  font-weight: 800;
+  font-size: 24px;
+}
+
+.card.unknown {
+  background: linear-gradient(150deg, #362947, #6f5780);
+}
+
+.card.consumed {
+  filter: grayscale(1) brightness(0.45);
+}
+
+footer {
+  justify-content: space-around;
+  font-size: 10px;
+}
+
+footer button {
+  font-size: 10px;
+  padding: 2px 4px;
+}
+
+.tooltip {
+  position: fixed;
+  left: 8px;
+  top: 44px;
+  max-width: 190px;
+  padding: 8px;
+  border-radius: 4px;
+  background: rgba(8, 8, 12, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  font-size: 12px;
+  pointer-events: none;
+}

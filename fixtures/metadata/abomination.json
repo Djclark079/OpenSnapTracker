@@ -1,0 +1,12 @@
+{
+  "key": "Abomination",
+  "name": "Abomination",
+  "cost": 5,
+  "power": 9,
+  "ability": "Foolish rabble! You are beneath me!",
+  "collectable": true,
+  "released": true,
+  "series": "Starter",
+  "image_url": "https://game-assets.snap.fan/card_variant_images/Abomination-1a5e6f63520f5b991a8000712f6ee5c99e8a5b1fdafc1c30e8016452894b58a5.webp",
+  "revision": 1
+}

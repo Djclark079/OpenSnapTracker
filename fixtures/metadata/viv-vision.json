@@ -1,0 +1,12 @@
+{
+  "key": "Viv",
+  "name": "Viv Vision",
+  "cost": 3,
+  "power": 4,
+  "ability": "At the start of each turn, give all cards in your hand +1 Power if you're winning here. Otherwise, move this to another location.",
+  "collectable": true,
+  "released": true,
+  "series": null,
+  "image_url": "https://game-assets.snap.fan/card_variant_images/Viv-68b5cd54d6d24819de51585de7fae79a6f27b5958344651055e886cec2b54aea.webp",
+  "revision": 1
+}

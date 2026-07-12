@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OpenSnapTracker Electron Spike</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="overlay" class="overlay">
+      <header>
+        <button data-mode="interactive" title="Interactive">I</button>
+        <strong id="title">Deck</strong>
+        <button data-mode="edit" title="Edit">E</button>
+      </header>
+      <main id="grid" class="grid"></main>
+      <footer>
+        <button>Deck <span>8</span></button>
+        <button>Hand <span>4</span></button>
+        <button id="zone-button">Destroyed <span>0</span></button>
+        <button>Discarded <span>0</span></button>
+        <button>Removed <span>0</span></button>
+      </footer>
+      <div id="tooltip" class="tooltip" hidden></div>
+    </div>
+    <script>
+      const { ipcRenderer } = require("electron");
+      const params = new URLSearchParams(location.search);
+      const id = params.get("id") || "player";
+      const title = document.getElementById("title");
+      const grid = document.getElementById("grid");
+      const tooltip = document.getElementById("tooltip");
+      let zone = false;
+
+      title.textContent = id === "player" ? "Player Deck" : "Opponent";
+
+      function render() {
+        grid.innerHTML = "";
+        for (let i = 0; i < 12; i += 1) {
+          const card = document.createElement("button");
+          card.className = "card";
+          if (id === "opponent" && i > 4) card.classList.add("unknown");
+          if (i === 1 || i === 6) card.classList.add("consumed");
+          card.textContent = id === "opponent" && i > 4 ? "?" : String(i + 1);
+          card.addEventListener("mouseenter", () => {
+            window.tooltipTimer = setTimeout(() => {
+              tooltip.textContent = `Placeholder ${i + 1} | Cost ${i % 6} | Power ${(i + 1) % 10} | Canonical ability text`;
+              tooltip.hidden = false;
+              tooltip.style.left = "8px";
+              tooltip.style.top = "44px";
+            }, 250);
+          });
+          card.addEventListener("mouseleave", () => {
+            clearTimeout(window.tooltipTimer);
+            tooltip.hidden = true;
+          });
+          grid.appendChild(card);
+        }
+      }
+
+      document.querySelectorAll("[data-mode]").forEach((button) => {
+        button.addEventListener("click", () => ipcRenderer.send("set-mode", button.dataset.mode));
+      });
+      document.getElementById("zone-button").addEventListener("click", () => {
+        zone = !zone;
+        title.textContent = zone ? "Destroyed" : id === "player" ? "Player Deck" : "Opponent";
+        render();
+      });
+      ipcRenderer.on("mode", (_event, mode) => {
+        document.body.dataset.mode = mode;
+        if (mode === "passthrough") tooltip.hidden = true;
+      });
+      render();
+    </script>
+  </body>
+</html>

@@ -7,7 +7,8 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.json",
     "start": "npm run build && electron .",
-    "start:x11": "npm run build && env XDG_SESSION_TYPE=x11 electron . --ozone-platform=x11 --force-device-scale-factor=1",
+    "start:x11": "npm run build && env XDG_SESSION_TYPE=x11 electron . --ozone-platform=x11 --force-device-scale-factor=1 --disable-gpu",
+    "start:kde-x11": "npm run build && env XDG_SESSION_TYPE=x11 electron . --ozone-platform=x11 --disable-gpu --reset-geometry --start-edit",
     "package:appimage": "npm run build && electron-builder --linux AppImage"
   },
   "devDependencies": {
@@ -37,5 +38,9 @@
         "--force-device-scale-factor=1"
       ]
     }
+  },
+  "allowScripts": {
+    "electron@40.10.2": true,
+    "electron-winstaller@5.4.0": true
   }
 }

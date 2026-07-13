@@ -11,15 +11,18 @@
       <header>
         <button data-mode="interactive" title="Interactive">I</button>
         <strong id="title">Deck</strong>
+        <span id="debug-badge" class="debug-badge">debug</span>
+        <button id="reset-button" title="Reset geometry">R</button>
         <button data-mode="edit" title="Edit">E</button>
       </header>
+      <div id="debug-line" class="debug-line"></div>
       <main id="grid" class="grid"></main>
       <footer>
-        <button>Deck <span>8</span></button>
-        <button>Hand <span>4</span></button>
+        <button><span>Deck</span><strong>8</strong></button>
+        <button><span>Hand</span><strong>4</strong></button>
         <button id="zone-button">Destroyed <span>0</span></button>
-        <button>Discarded <span>0</span></button>
-        <button>Removed <span>0</span></button>
+        <button><span>Discard</span><strong>0</strong></button>
+        <button><span>Removed</span><strong>0</strong></button>
       </footer>
       <div id="tooltip" class="tooltip" hidden></div>
     </div>
@@ -30,9 +33,13 @@
       const title = document.getElementById("title");
       const grid = document.getElementById("grid");
       const tooltip = document.getElementById("tooltip");
+      const debugBadge = document.getElementById("debug-badge");
+      const debugLine = document.getElementById("debug-line");
       let zone = false;
 
       title.textContent = id === "player" ? "Player Deck" : "Opponent";
+      debugBadge.textContent = id.toUpperCase();
+      document.body.dataset.overlayId = id;
 
       function render() {
         grid.innerHTML = "";
@@ -61,6 +68,7 @@
       document.querySelectorAll("[data-mode]").forEach((button) => {
         button.addEventListener("click", () => ipcRenderer.send("set-mode", button.dataset.mode));
       });
+      document.getElementById("reset-button").addEventListener("click", () => ipcRenderer.send("reset-geometry"));
       document.getElementById("zone-button").addEventListener("click", () => {
         zone = !zone;
         title.textContent = zone ? "Destroyed" : id === "player" ? "Player Deck" : "Opponent";
@@ -69,6 +77,10 @@
       ipcRenderer.on("mode", (_event, mode) => {
         document.body.dataset.mode = mode;
         if (mode === "passthrough") tooltip.hidden = true;
+      });
+      ipcRenderer.on("debug-state", (_event, state) => {
+        const bounds = state.bounds;
+        debugLine.textContent = `${state.id} | ${state.mode} | ${bounds.x},${bounds.y} ${bounds.width}x${bounds.height}`;
       });
       render();
     </script>

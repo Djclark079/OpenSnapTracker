@@ -707,6 +707,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "domain",
  "serde_json",
  "state-reader",
  "tempfile",

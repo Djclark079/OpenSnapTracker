@@ -340,6 +340,7 @@ function startTrackerSidecar(): void {
   if (!stateDir) return;
   const outputJson = overlayPayloadPath() ?? defaultLivePayloadPath();
   overlayPayloadWatchPath = outputJson;
+  fs.rmSync(outputJson, { force: true });
   sidecar = spawn(
     "cargo",
     [
@@ -381,7 +382,8 @@ function createOverlay(id: OverlayId, geometry: Geometry): BrowserWindow {
     backgroundColor: "#00000000",
     webPreferences: {
       nodeIntegration: true,
-      contextIsolation: false
+      contextIsolation: false,
+      backgroundThrottling: false
     }
   });
 

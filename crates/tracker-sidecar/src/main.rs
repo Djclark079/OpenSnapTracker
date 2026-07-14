@@ -1,10 +1,14 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use domain::{CardInstanceId, CardKey, CardKnowledge, Zone};
 use state_reader::{
-    OverlayProjector, ReadOptions, ReconciliationInput, SnapshotObservation, observe_game_state,
+    OverlayProjector, ReadOptions, ReconciliationInput, SnapshotObservation, TextOverlayCard,
+    TextOverlayPayload, TextOverlaySlot, TextOverlaySlotState, observe_game_state,
     read_json_snapshot, reconcile_observation, text_overlay_payload,
 };
 use std::{
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -17,6 +21,7 @@ use std::{
 
 const DEFAULT_STATE_SUFFIX: &str = ".steam/steam/steamapps/compatdata/1997040/pfx/drive_c/users/steamuser/AppData/LocalLow/Second Dinner/SNAP/Standalone/States/nvprod";
 const GAME_STATE_FILENAME: &str = "GameState.json";
+const COLLECTION_STATE_FILENAME: &str = "CollectionState.json";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,11 +43,21 @@ struct Args {
 #[derive(Debug)]
 struct LiveTracker {
     state_file: PathBuf,
+    collection_file: PathBuf,
     output_json: PathBuf,
     interval: Duration,
     previous_hash: Option<String>,
+    previous_collection_hash: Option<String>,
+    collection_decks: Vec<CollectionDeck>,
+    matched_player_deck: Option<CollectionDeck>,
     previous_observation: Option<SnapshotObservation>,
     projector: OverlayProjector,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CollectionDeck {
+    name: String,
+    cards: Vec<CardKey>,
 }
 
 fn main() -> Result<()> {
@@ -52,7 +67,7 @@ fn main() -> Result<()> {
         .or_else(default_state_dir)
         .context("could not determine a state directory; pass --state-dir")?;
     let mut tracker = LiveTracker::new(
-        state_dir.join(GAME_STATE_FILENAME),
+        state_dir,
         args.output_json,
         Duration::from_millis(args.interval_ms),
     );
@@ -78,12 +93,16 @@ fn main() -> Result<()> {
 }
 
 impl LiveTracker {
-    fn new(state_file: PathBuf, output_json: PathBuf, interval: Duration) -> Self {
+    fn new(state_dir: PathBuf, output_json: PathBuf, interval: Duration) -> Self {
         Self {
-            state_file,
+            state_file: state_dir.join(GAME_STATE_FILENAME),
+            collection_file: state_dir.join(COLLECTION_STATE_FILENAME),
             output_json,
             interval,
             previous_hash: None,
+            previous_collection_hash: None,
+            collection_decks: Vec::new(),
+            matched_player_deck: None,
             previous_observation: None,
             projector: OverlayProjector::new(),
         }
@@ -93,8 +112,10 @@ impl LiveTracker {
         let snapshot = read_json_snapshot(&self.state_file, ReadOptions::default())
             .with_context(|| format!("read {}", self.state_file.display()))?;
         if self.previous_hash.as_deref() == Some(snapshot.sha256.as_str()) {
+            self.refresh_collection_decks()?;
             return Ok(false);
         }
+        self.refresh_collection_decks()?;
 
         let observation = observe_game_state(&snapshot.parsed)
             .with_context(|| format!("observe {}", self.state_file.display()))?;
@@ -104,12 +125,82 @@ impl LiveTracker {
             snapshot_version: Some(snapshot.sha256.clone()),
         });
         let projection = self.projector.project(&observation, &events);
-        let payload = text_overlay_payload(&projection);
+        let mut payload = text_overlay_payload(&projection);
+        self.enrich_player_deck(&mut payload);
         write_json_atomic(&self.output_json, &serde_json::to_vec_pretty(&payload)?)?;
 
         self.previous_hash = Some(snapshot.sha256);
         self.previous_observation = Some(observation);
         Ok(true)
+    }
+
+    fn refresh_collection_decks(&mut self) -> Result<()> {
+        let snapshot = match read_json_snapshot(&self.collection_file, ReadOptions::default()) {
+            Ok(snapshot) => snapshot,
+            Err(state_reader::SnapshotReadError::Io { .. }) => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read {}", self.collection_file.display()));
+            }
+        };
+        if self.previous_collection_hash.as_deref() == Some(snapshot.sha256.as_str()) {
+            return Ok(());
+        }
+        self.collection_decks = parse_collection_decks(&snapshot.parsed);
+        self.previous_collection_hash = Some(snapshot.sha256);
+        Ok(())
+    }
+
+    fn enrich_player_deck(&mut self, payload: &mut TextOverlayPayload) {
+        if self.collection_decks.is_empty() {
+            return;
+        }
+        let observed_keys = observed_player_keys(payload);
+        if observed_keys.is_empty() {
+            return;
+        }
+        if self
+            .matched_player_deck
+            .as_ref()
+            .is_none_or(|deck| !deck_matches(deck, &observed_keys))
+            && let Some(deck) = best_matching_deck(&self.collection_decks, &observed_keys)
+        {
+            self.matched_player_deck = Some(deck.clone());
+        }
+
+        let Some(deck) = &self.matched_player_deck else {
+            return;
+        };
+        let observed_by_key = payload
+            .player
+            .deck_slots
+            .iter()
+            .filter_map(|slot| slot.card.as_ref())
+            .filter_map(|card| {
+                card.card_definition_key
+                    .as_ref()
+                    .map(|key| (key.clone(), card.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+
+        payload.player.title = deck.name.clone();
+        payload.player.deck_slots = deck
+            .cards
+            .iter()
+            .take(12)
+            .enumerate()
+            .map(|(index, key)| {
+                let card = observed_by_key
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| deck_text_card(index, key));
+                TextOverlaySlot {
+                    slot_index: index as u8,
+                    state: TextOverlaySlotState::Known,
+                    card: Some(card),
+                }
+            })
+            .collect();
     }
 }
 
@@ -131,6 +222,77 @@ fn write_json_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn parse_collection_decks(value: &serde_json::Value) -> Vec<CollectionDeck> {
+    value
+        .pointer("/ServerState/Decks")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|deck| {
+            let name = deck.get("Name")?.as_str()?.to_string();
+            let cards = deck
+                .get("Cards")?
+                .as_array()?
+                .iter()
+                .filter_map(|card| card.get("CardDefId")?.as_str())
+                .map(|key| CardKey(key.to_string()))
+                .collect::<Vec<_>>();
+            (cards.len() >= 12).then_some(CollectionDeck { name, cards })
+        })
+        .collect()
+}
+
+fn observed_player_keys(payload: &TextOverlayPayload) -> HashSet<CardKey> {
+    payload
+        .player
+        .deck_slots
+        .iter()
+        .filter_map(|slot| slot.card.as_ref())
+        .filter_map(|card| card.card_definition_key.clone())
+        .collect()
+}
+
+fn deck_matches(deck: &CollectionDeck, observed_keys: &HashSet<CardKey>) -> bool {
+    observed_keys.iter().all(|key| deck.cards.contains(key))
+}
+
+fn best_matching_deck<'a>(
+    decks: &'a [CollectionDeck],
+    observed_keys: &HashSet<CardKey>,
+) -> Option<&'a CollectionDeck> {
+    let mut scored = decks
+        .iter()
+        .map(|deck| {
+            let score = observed_keys
+                .iter()
+                .filter(|key| deck.cards.contains(key))
+                .count();
+            (score, deck)
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect::<Vec<_>>();
+    scored.sort_by_key(|(score, _)| Reverse(*score));
+    let (best_score, best_deck) = scored.first()?;
+    let tied = scored
+        .iter()
+        .filter(|(score, _)| score == best_score)
+        .count();
+    (tied == 1).then_some(*best_deck)
+}
+
+fn deck_text_card(index: usize, key: &CardKey) -> TextOverlayCard {
+    TextOverlayCard {
+        instance_id: CardInstanceId(format!("collection:{index}:{}", key.0)),
+        label: key.0.clone(),
+        card_definition_key: Some(key.clone()),
+        knowledge: CardKnowledge::KnownCard,
+        zone: Zone::Deck,
+        raw_zone: None,
+        original_deck_candidate: true,
+        consumed_from_deck: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,14 +301,15 @@ mod tests {
     #[test]
     fn live_tracker_writes_payload_once_and_skips_unchanged_hash() {
         let temp = tempdir().expect("tempdir");
-        let state_file = temp.path().join(GAME_STATE_FILENAME);
+        let state_dir = temp.path().to_path_buf();
+        let state_file = state_dir.join(GAME_STATE_FILENAME);
         let output_json = temp.path().join("overlay.json");
         fs::write(
             &state_file,
             include_str!("../../../fixtures/snapshots/sanitized-active-turn.json"),
         )
         .expect("write fixture");
-        let mut tracker = LiveTracker::new(state_file, output_json.clone(), Duration::ZERO);
+        let mut tracker = LiveTracker::new(state_dir, output_json.clone(), Duration::ZERO);
 
         assert!(tracker.tick().expect("first tick"));
         assert!(!tracker.tick().expect("second tick skips unchanged"));
@@ -161,6 +324,63 @@ mod tests {
         );
         assert_eq!(
             payload["opponent"]["deck_slots"].as_array().unwrap().len(),
+            12
+        );
+    }
+
+    #[test]
+    fn collection_deck_enrichment_seeds_player_slots_and_title() {
+        let temp = tempdir().expect("tempdir");
+        let state_dir = temp.path().to_path_buf();
+        let state_file = state_dir.join(GAME_STATE_FILENAME);
+        let collection_file = state_dir.join(COLLECTION_STATE_FILENAME);
+        let output_json = temp.path().join("overlay.json");
+        fs::write(
+            &state_file,
+            include_str!("../../../fixtures/snapshots/sanitized-active-turn.json"),
+        )
+        .expect("write fixture");
+        fs::write(
+            &collection_file,
+            serde_json::json!({
+                "ServerState": {
+                    "Decks": [{
+                        "Name": "Fixture Discard",
+                        "Cards": [
+                            {"CardDefId": "Abomination"},
+                            {"CardDefId": "Blade"},
+                            {"CardDefId": "Dracula"},
+                            {"CardDefId": "Gambit"},
+                            {"CardDefId": "MoonKnight"},
+                            {"CardDefId": "Apocalypse"},
+                            {"CardDefId": "Morbius"},
+                            {"CardDefId": "Modok"},
+                            {"CardDefId": "LadySif"},
+                            {"CardDefId": "Scorn"},
+                            {"CardDefId": "Loki"},
+                            {"CardDefId": "CorvusGlaive"}
+                        ]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write collection");
+        let mut tracker = LiveTracker::new(state_dir, output_json.clone(), Duration::ZERO);
+
+        assert!(tracker.tick().expect("tick"));
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&fs::read(output_json).expect("read payload"))
+                .expect("payload parses");
+        assert_eq!(payload["player"]["title"], "Fixture Discard");
+        assert_eq!(
+            payload["player"]["deck_slots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|slot| slot["state"] == "known")
+                .count(),
             12
         );
     }

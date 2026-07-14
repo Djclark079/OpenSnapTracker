@@ -813,6 +813,13 @@ fn effective_projection_zone(
     {
         return zone;
     }
+    if card.raw_zone.as_deref() == Some("Graveyard") {
+        match card.previous_domain_zone {
+            Some(Zone::Hand) => return Zone::Discarded,
+            Some(Zone::Board) => return Zone::Destroyed,
+            _ => {}
+        }
+    }
     card.domain_zone
 }
 
@@ -1398,6 +1405,13 @@ mod tests {
                 ..
             } if id == "game:21"
         )));
+
+        let projection = project_overlay(&after);
+        assert_eq!(projection.player.discarded_count, 1);
+        assert!(projection.player.cards.iter().any(|card| {
+            card.instance_id == CardInstanceId("game:21".to_string())
+                && card.zone == Zone::Discarded
+        }));
     }
 
     #[test]
@@ -1432,6 +1446,13 @@ mod tests {
                 ..
             } if id == "game:31"
         )));
+
+        let projection = project_overlay(&after);
+        assert_eq!(projection.opponent.destroyed_count, 1);
+        assert!(projection.opponent.cards.iter().any(|card| {
+            card.instance_id == CardInstanceId("game:31".to_string())
+                && card.zone == Zone::Destroyed
+        }));
     }
 
     #[test]

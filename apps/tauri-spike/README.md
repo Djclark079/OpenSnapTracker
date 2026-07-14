@@ -17,7 +17,13 @@ npm run tauri:dev
 Try X11/XWayland launch:
 
 ```sh
-env XDG_SESSION_TYPE=x11 npm run tauri:dev -- -- --ozone-platform=x11 --force-device-scale-factor=1
+npm run tauri:dev-x11
+```
+
+Try plain decorated windows if the overlay launch fails:
+
+```sh
+npm run tauri:dev-plain
 ```
 
 Package attempt:
@@ -26,4 +32,10 @@ Package attempt:
 npm run tauri:build
 ```
 
-This spike still needs manual verification for reliable passthrough and global hotkeys. Record results in `../../docs/overlay-spike.md`.
+This spike still needs manual verification for startup stability, transparency, passthrough, and global hotkeys. Record results in `../../docs/overlay-spike.md`.
+
+Hotkeys:
+- `Ctrl+Shift+P`: toggle passthrough.
+- `Ctrl+Shift+E`: toggle edit mode.
+- `Ctrl+Shift+H`: toggle visibility.
+- `Ctrl+Shift+R`: reset both windows.

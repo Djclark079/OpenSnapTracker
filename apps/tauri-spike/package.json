@@ -8,10 +8,13 @@
     "build": "tsc --noEmit && vite build",
     "start": "vite --host 127.0.0.1",
     "tauri:dev": "tauri dev",
+    "tauri:dev-x11": "env GDK_BACKEND=x11 WEBKIT_DISABLE_DMABUF_RENDERER=1 XDG_SESSION_TYPE=x11 tauri dev",
+    "tauri:dev-plain": "env GDK_BACKEND=x11 WEBKIT_DISABLE_DMABUF_RENDERER=1 XDG_SESSION_TYPE=x11 OST_TAURI_PLAIN_WINDOWS=1 tauri dev",
     "tauri:build": "tauri build"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.0.0"
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-global-shortcut": "^2.0.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",

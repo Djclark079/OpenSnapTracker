@@ -1,14 +1,33 @@
 # Architecture
 
-OpenSnapTracker is Rust-first. The shell may be Electron or Tauri, but state reading, normalization, reconciliation, metadata, storage, image caching, and diagnostics should stay in Rust where practical.
+OpenSnapTracker uses Electron for the v1 desktop shell and Rust for the core tracker engine. State reading, normalization, reconciliation, metadata, storage, image caching, and diagnostics should stay in Rust where practical.
+
+Electron was selected from spike evidence, not preference: it demonstrated the required KDE Wayland/XWayland overlay behavior with fewer compatibility problems than Tauri.
 
 ## Pipeline
 
 ```text
-State files -> Snapshot Reader -> Normalizer -> Reconciliation -> Events -> Match State -> Overlay Views
+State files
+  -> Rust Snapshot Reader
+  -> Rust Normalizer
+  -> Rust Reconciliation
+  -> Structured Events
+  -> Current Match State
+  -> Electron Overlay Views
 ```
 
 The snapshot reader treats files as externally owned and possibly mid-write. It retries parse failures with bounded backoff and never repairs malformed JSON.
+
+## Desktop Shell
+
+Electron owns the local desktop shell:
+- two transparent overlay windows
+- global hotkeys
+- passthrough/edit/interactive modes
+- persistent geometry
+- AppImage packaging
+
+The Rust core should be callable from Electron through a sidecar process, IPC boundary, or other small integration layer chosen during the next implementation milestone. The core should not depend on Electron APIs.
 
 ## Domain Principles
 

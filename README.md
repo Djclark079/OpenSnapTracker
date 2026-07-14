@@ -8,10 +8,11 @@ This is not a web application and does not inject into or modify the game proces
 
 The repository is a foundation and technology spike, not a finished tracker. It contains:
 - Rust domain, snapshot-reader, capture, storage, metadata, and image-cache foundations.
-- Electron and Tauri overlay spike scaffolds for comparing Linux overlay behavior.
+- An Electron overlay spike selected as the v1 desktop shell baseline.
+- A Tauri overlay spike retained as a rejected-for-v1 comparison.
 - Documentation and manual KDE Wayland/XWayland test checklists.
 
-The final desktop shell is intentionally undecided until the spike results are collected.
+Electron is selected for the v1 desktop shell based on KDE Wayland/XWayland spike results. Rust remains the preferred implementation language for the core tracker engine.
 
 ## Target
 
@@ -31,7 +32,7 @@ Marvel Snap state files
   -> State Reconciliation Engine
   -> Structured Events
   -> Current Match State
-  -> Overlay Views
+  -> Electron Overlay Views
 ```
 
 The client works offline after metadata and art are cached. The public client never contains the private oanor API key.
@@ -39,8 +40,8 @@ The client works offline after metadata and art are cached. The public client ne
 ## Prerequisites
 
 - Rust toolchain with `cargo`, `rustfmt`, and `clippy`.
-- Node.js and npm for overlay spikes.
-- Linux packages required by Electron/Tauri may vary by distribution.
+- Node.js and npm for the Electron shell and overlay spike.
+- Linux packages required by Electron/AppImage may vary by distribution.
 
 ## Commands
 
@@ -63,8 +64,7 @@ cargo run -p state-capture -- \
 ## Known Unknowns
 
 - Exact Marvel Snap state semantics for card instances and transitions.
-- Whether Electron or Tauri is more reliable for two floating overlay windows.
-- Which XWayland launch flags are truly required.
+- Exact production XWayland launch flags and AppImage desktop entry details.
 - How transformed, merged, generated, transferred, and stolen cards appear in state files.
 - Whether direct automated fetching from upstream image URLs is permitted for distribution.
 

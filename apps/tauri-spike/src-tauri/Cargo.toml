@@ -11,6 +11,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+tauri-plugin-global-shortcut = "2"
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -255,11 +255,11 @@ Version one does not require:
 
 ## Shell decision
 
-Electron and Tauri 2 remain candidates.
+Electron is selected for the v1 desktop shell.
 
-The shell must be selected using an overlay technology spike, not preference alone.
+The decision was made from overlay technology spike evidence, not preference alone.
 
-The spike must test:
+The spike tested:
 - two transparent windows
 - always-on-top behavior
 - hover interaction
@@ -270,6 +270,10 @@ The spike must test:
 - multi-monitor behavior
 - XWayland startup
 - AppImage packaging
+
+Electron passed the required KDE Plasma Wayland/XWayland behavior closely enough to become the v1 shell baseline.
+
+Tauri 2 is rejected for v1. It remains useful as comparison evidence, but it required WebKitGTK/X11 workarounds, had transparent-window repaint artifacts, needed more custom shortcut/window plumbing, and carried unresolved AppImage bundling risk.
 
 ## Known Linux requirement
 

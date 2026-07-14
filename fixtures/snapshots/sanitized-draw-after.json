@@ -1,0 +1,136 @@
+{
+  "$id": "1",
+  "$type": "SecondDinner.SanitizedFixture",
+  "ApplicationVersion": "54.12",
+  "RemoteGame": {
+    "ClientGameInfo": {
+      "LocalPlayerEntityId": 2,
+      "EnemyPlayerEntityId": 7
+    },
+    "ClientPlayerInfo": {
+      "CardsDrawn": [21, 20],
+      "CardsPlayed": [],
+      "ClientStageRequests": []
+    },
+    "GameState": {
+      "Turn": 2,
+      "TotalTurns": 6,
+      "GameMode": {
+        "$type": "CubeGame.BattleGameMode, SecondDinner.CubeGame.Logic",
+        "Data": {
+          "$type": "CubeGame.BattleGameModeData, SecondDinner.CubeGame",
+          "BattleHistory": {
+            "GameResults": []
+          }
+        }
+      },
+      "_players": [
+        {
+          "$id": "2",
+          "$type": "CubeGame.Player, SecondDinner.CubeGame.Logic",
+          "EntityId": 2,
+          "Deck": {
+            "$id": "3",
+            "$type": "CubeGame.Deck, SecondDinner.CubeGame.Logic",
+            "ZoneId": "Deck",
+            "_cards": []
+          },
+          "Hand": {
+            "$id": "4",
+            "$type": "CubeGame.Hand, SecondDinner.CubeGame.Logic",
+            "ZoneId": "Hand",
+            "_cards": [{ "$ref": "11" }, { "$ref": "10" }]
+          },
+          "Graveyard": {
+            "$id": "5",
+            "$type": "CubeGame.Zone, SecondDinner.CubeGame.Logic",
+            "ZoneId": "Graveyard",
+            "_cards": []
+          },
+          "Banished": {
+            "$id": "6",
+            "$type": "CubeGame.Zone, SecondDinner.CubeGame.Logic",
+            "ZoneId": "Banished",
+            "_cards": []
+          }
+        },
+        {
+          "$id": "7",
+          "$type": "CubeGame.Player, SecondDinner.CubeGame.Logic",
+          "EntityId": 7,
+          "Deck": {
+            "$id": "8",
+            "$type": "CubeGame.Deck, SecondDinner.CubeGame.Logic",
+            "ZoneId": "Deck",
+            "_cards": [{ "$ref": "12" }]
+          },
+          "Hand": {
+            "$id": "9",
+            "$type": "CubeGame.Hand, SecondDinner.CubeGame.Logic",
+            "ZoneId": "Hand",
+            "_cards": [{ "$ref": "13" }]
+          },
+          "Graveyard": {
+            "$id": "14",
+            "$type": "CubeGame.Zone, SecondDinner.CubeGame.Logic",
+            "ZoneId": "Graveyard",
+            "_cards": []
+          },
+          "Banished": {
+            "$id": "15",
+            "$type": "CubeGame.Zone, SecondDinner.CubeGame.Logic",
+            "ZoneId": "Banished",
+            "_cards": []
+          }
+        }
+      ],
+      "CardsByEntityId": {
+        "20": {
+          "$id": "10",
+          "$type": "CubeGame.Card, SecondDinner.CubeGame.Logic",
+          "EntityId": 20,
+          "CardDefId": "Viv",
+          "Owner": { "$ref": "2" },
+          "_zone": { "$ref": "4" },
+          "_previousZone": { "$ref": "3" },
+          "StartedInDeckEntityId": 3,
+          "TurnToDraw": 2,
+          "ZonePosition": 1
+        },
+        "21": {
+          "$id": "11",
+          "$type": "CubeGame.Card, SecondDinner.CubeGame.Logic",
+          "EntityId": 21,
+          "CardDefId": "Abomination",
+          "Owner": { "$ref": "2" },
+          "_zone": { "$ref": "4" },
+          "_previousZone": { "$ref": "3" },
+          "StartedInDeckEntityId": 3,
+          "TurnToDraw": 1,
+          "ZonePosition": 0
+        },
+        "30": {
+          "$id": "12",
+          "$type": "CubeGame.Card, SecondDinner.CubeGame.Logic",
+          "EntityId": 30,
+          "CardDefId": null,
+          "Owner": { "$ref": "7" },
+          "_zone": { "$ref": "8" },
+          "TurnToDraw": 2,
+          "ZonePosition": -1
+        },
+        "31": {
+          "$id": "13",
+          "$type": "CubeGame.Card, SecondDinner.CubeGame.Logic",
+          "EntityId": 31,
+          "CardDefId": null,
+          "Owner": { "$ref": "7" },
+          "_zone": { "$ref": "9" },
+          "_previousZone": { "$ref": "8" },
+          "TurnToDraw": 1
+        }
+      }
+    }
+  },
+  "fixture_note": "Sanitized hand-built fixture for a deck-to-hand draw transition."
+}

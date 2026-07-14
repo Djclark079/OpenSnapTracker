@@ -41,7 +41,7 @@ Progress:
 - [x] Dev inspection command added for ignored local captures.
 - [x] Sanitized fixtures derived from observed capture structure.
 - [x] Snapshot observation normalizer implemented against fixture-backed schema observations.
-- [ ] Reconciliation engine maps observation diffs into domain events.
+- [x] First reconciliation pass maps observation diffs into conservative domain events.
 - [ ] Destroy/discard/remove semantics validated with targeted fixtures.
 
 ## Milestone 3: Overlay Shell Decision
@@ -64,3 +64,4 @@ Acceptance criteria:
 - 2026-07-13: Electron selected for v1 desktop shell. KDE Wayland/XWayland testing showed Electron working for two transparent windows, always-on-top over Marvel Snap, passthrough, hover without focus theft, visibility toggle, edit move/resize, second-monitor movement, reset, relaunch geometry, and AppImage packaging. Tauri is rejected for v1 because it required WebKitGTK/X11 workarounds, had transparent-window repaint artifacts, needed more custom shortcut/window plumbing, and still had AppImage bundling risk.
 - 2026-07-14: Initial real Conquest captures show Marvel Snap state uses JSON.NET-style `$id`/`$ref` references. Parser normalization must resolve references before interpreting players, zones, card instances, and transitions. GameState file existence alone is not an active-match signal because stale completed-match state can remain present.
 - 2026-07-14: The first normalizer layer is an observation model, not the final event engine. It preserves raw zone names and maps `Graveyard` to `UnknownTransition` until destroy/discard semantics are proven by transition fixtures.
+- 2026-07-14: First reconciliation pass emits only conservative events from fixture-backed observations: match start, card instance observed, draw, play, reveal, generated, and unknown transition. Raw `Graveyard` movement still does not imply destroyed or discarded.

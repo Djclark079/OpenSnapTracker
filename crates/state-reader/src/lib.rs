@@ -4,7 +4,10 @@
 //! replaced or rewritten while the game is running. It retries boundedly on
 //! transient parse failures and never repairs malformed JSON.
 
-use domain::{CardKey, MatchLifecycle, Participant, Zone};
+use domain::{
+    CardInstance, CardInstanceId, CardKey, CardKnowledge, CardOrigin, MatchEvent, MatchLifecycle,
+    Participant, Provenance, Zone,
+};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, fs, io, path::Path, thread, time::Duration};
 use thiserror::Error;
@@ -185,6 +188,13 @@ pub enum ObservedTransition {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconciliationInput<'a> {
+    pub previous: Option<&'a SnapshotObservation>,
+    pub current: &'a SnapshotObservation,
+    pub snapshot_version: Option<String>,
+}
+
 #[derive(Debug, Error)]
 pub enum NormalizeError {
     #[error("snapshot does not contain /RemoteGame/GameState")]
@@ -328,6 +338,133 @@ pub fn diff_observations(
     }
 
     transitions
+}
+
+#[must_use]
+pub fn reconcile_observation(input: ReconciliationInput<'_>) -> Vec<MatchEvent> {
+    let mut events = Vec::new();
+
+    if input.previous.is_none() && input.current.lifecycle == MatchLifecycle::InMatch {
+        events.push(MatchEvent::MatchStarted {
+            snapshot_version: input.snapshot_version.clone(),
+        });
+    }
+
+    for warning in &input.current.warnings {
+        events.push(MatchEvent::SnapshotParseWarning {
+            message: warning.clone(),
+        });
+    }
+
+    match input.previous {
+        None => {
+            for card in &input.current.cards {
+                events.push(MatchEvent::CardInstanceObserved {
+                    card: card_instance_from_observation(card),
+                });
+            }
+        }
+        Some(previous) => {
+            if previous.lifecycle != MatchLifecycle::MatchEnded
+                && input.current.lifecycle == MatchLifecycle::MatchEnded
+            {
+                events.push(MatchEvent::MatchEnded);
+            }
+
+            let current_by_entity_id: HashMap<i64, &CardObservation> = input
+                .current
+                .cards
+                .iter()
+                .map(|card| (card.entity_id, card))
+                .collect();
+
+            for transition in diff_observations(previous, input.current) {
+                match transition {
+                    ObservedTransition::CardAppeared { entity_id, .. } => {
+                        if let Some(card) = current_by_entity_id.get(&entity_id) {
+                            events.push(MatchEvent::CardInstanceObserved {
+                                card: card_instance_from_observation(card),
+                            });
+                            if card.started_in_deck_entity_id.is_none() {
+                                events.push(MatchEvent::CardGenerated {
+                                    card: card_instance_id(entity_id),
+                                    origin: CardOrigin::UnknownExternal,
+                                });
+                            }
+                        }
+                    }
+                    ObservedTransition::CardDefinitionRevealed { entity_id, .. } => {
+                        events.push(MatchEvent::CardRevealed {
+                            card: card_instance_id(entity_id),
+                        });
+                    }
+                    ObservedTransition::CardZoneChanged {
+                        entity_id,
+                        from_domain_zone,
+                        to_domain_zone,
+                        from_raw_zone,
+                        to_raw_zone,
+                    } => match (from_domain_zone, to_domain_zone) {
+                        (Zone::Deck, Zone::Hand) => events.push(MatchEvent::CardDrawn {
+                            card: card_instance_id(entity_id),
+                        }),
+                        (Zone::Hand, Zone::Board) => events.push(MatchEvent::CardPlayed {
+                            card: card_instance_id(entity_id),
+                        }),
+                        (_, Zone::UnknownTransition) => {
+                            events.push(MatchEvent::UnknownTransitionObserved {
+                                card: Some(card_instance_id(entity_id)),
+                                details: serde_json::json!({
+                                    "from_raw_zone": from_raw_zone,
+                                    "to_raw_zone": to_raw_zone,
+                                    "reason": "raw zone requires reconciliation context"
+                                }),
+                            });
+                        }
+                        _ => events.push(MatchEvent::UnknownTransitionObserved {
+                            card: Some(card_instance_id(entity_id)),
+                            details: serde_json::json!({
+                                "from_raw_zone": from_raw_zone,
+                                "to_raw_zone": to_raw_zone,
+                                "from_domain_zone": format!("{from_domain_zone:?}"),
+                                "to_domain_zone": format!("{to_domain_zone:?}")
+                            }),
+                        }),
+                    },
+                }
+            }
+        }
+    }
+
+    events
+}
+
+fn card_instance_from_observation(card: &CardObservation) -> CardInstance {
+    CardInstance {
+        internal_instance_id: card_instance_id(card.entity_id),
+        external_game_instance_id: Some(card.entity_id.to_string()),
+        card_definition_key: card.card_definition_key.clone(),
+        owner: card.owner,
+        controller: card.owner,
+        origin: if card.started_in_deck_entity_id.is_some() {
+            CardOrigin::OriginalDeck
+        } else {
+            CardOrigin::Unknown
+        },
+        current_zone: card.domain_zone,
+        previous_zone: card.previous_domain_zone,
+        original_deck_slot: None,
+        knowledge: if card.is_known() {
+            CardKnowledge::KnownCard
+        } else {
+            CardKnowledge::UnknownCard
+        },
+        provenance: Provenance::observed(),
+    }
+}
+
+fn card_instance_id(entity_id: i64) -> CardInstanceId {
+    CardInstanceId(format!("game:{entity_id}"))
 }
 
 fn infer_lifecycle(
@@ -724,5 +861,123 @@ mod tests {
             from_domain_zone: Zone::Hand,
             to_domain_zone: Zone::Board,
         }));
+    }
+
+    #[test]
+    fn reconciles_initial_snapshot_into_match_started_and_observed_instances() {
+        let value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-active-turn.json"
+        ))
+        .expect("fixture parses");
+        let observation = observe_game_state(&value).expect("observes game state");
+
+        let events = reconcile_observation(ReconciliationInput {
+            previous: None,
+            current: &observation,
+            snapshot_version: Some("fixture-1".to_string()),
+        });
+
+        assert!(events.contains(&MatchEvent::MatchStarted {
+            snapshot_version: Some("fixture-1".to_string())
+        }));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            MatchEvent::CardInstanceObserved { card }
+                if card.internal_instance_id == CardInstanceId("game:21".to_string())
+                    && card.card_definition_key == Some(CardKey("Abomination".to_string()))
+                    && card.owner == Participant::Player
+                    && card.current_zone == Zone::Hand
+        )));
+    }
+
+    #[test]
+    fn reconciles_draw_play_reveal_and_generated_observations() {
+        let before: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-active-turn.json"
+        ))
+        .expect("before fixture parses");
+        let after: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-transition-after.json"
+        ))
+        .expect("after fixture parses");
+        let before = observe_game_state(&before).expect("observes before");
+        let after = observe_game_state(&after).expect("observes after");
+
+        let events = reconcile_observation(ReconciliationInput {
+            previous: Some(&before),
+            current: &after,
+            snapshot_version: Some("fixture-2".to_string()),
+        });
+
+        assert!(events.contains(&MatchEvent::CardGenerated {
+            card: CardInstanceId("game:22".to_string()),
+            origin: CardOrigin::UnknownExternal,
+        }));
+        assert!(events.contains(&MatchEvent::CardRevealed {
+            card: CardInstanceId("game:31".to_string()),
+        }));
+        assert!(events.contains(&MatchEvent::CardPlayed {
+            card: CardInstanceId("game:31".to_string()),
+        }));
+    }
+
+    #[test]
+    fn reconciles_deck_to_hand_as_drawn() {
+        let before: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-active-turn.json"
+        ))
+        .expect("before fixture parses");
+        let after: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-draw-after.json"
+        ))
+        .expect("after fixture parses");
+        let before = observe_game_state(&before).expect("observes before");
+        let after = observe_game_state(&after).expect("observes after");
+
+        let events = reconcile_observation(ReconciliationInput {
+            previous: Some(&before),
+            current: &after,
+            snapshot_version: Some("fixture-draw".to_string()),
+        });
+
+        assert!(events.contains(&MatchEvent::CardDrawn {
+            card: CardInstanceId("game:20".to_string()),
+        }));
+        assert!(events.contains(&MatchEvent::CardRevealed {
+            card: CardInstanceId("game:20".to_string()),
+        }));
+    }
+
+    #[test]
+    fn reconciles_graveyard_movement_as_unknown_transition() {
+        let before: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-transition-after.json"
+        ))
+        .expect("before fixture parses");
+        let after: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-graveyard-after.json"
+        ))
+        .expect("after fixture parses");
+        let before = observe_game_state(&before).expect("observes before");
+        let after = observe_game_state(&after).expect("observes after");
+
+        let events = reconcile_observation(ReconciliationInput {
+            previous: Some(&before),
+            current: &after,
+            snapshot_version: Some("fixture-graveyard".to_string()),
+        });
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            MatchEvent::UnknownTransitionObserved {
+                card: Some(card),
+                details
+            } if card == &CardInstanceId("game:31".to_string())
+                && details["to_raw_zone"] == "Graveyard"
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            MatchEvent::CardDestroyed { .. } | MatchEvent::CardDiscarded { .. }
+        )));
     }
 }

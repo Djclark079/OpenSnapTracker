@@ -6,6 +6,24 @@ type OverlayId = "player" | "opponent";
 type Mode = "interactive" | "passthrough" | "edit";
 type Geometry = { x: number; y: number; width: number; height: number };
 type GeometryStore = Record<OverlayId, Geometry>;
+type ResizeEdge = "east" | "south" | "south-east" | "west" | "south-west";
+type ResizeRequest = {
+  id: OverlayId;
+  screenX: number;
+  screenY: number;
+};
+type ResizeStartRequest = {
+  id: OverlayId;
+  edge: ResizeEdge;
+  startScreenX: number;
+  startScreenY: number;
+};
+type ActiveResize = {
+  edge: ResizeEdge;
+  startBounds: Geometry;
+  startScreenX: number;
+  startScreenY: number;
+};
 type OverlayPayload = Record<string, unknown> & {
   player?: unknown;
   opponent?: unknown;
@@ -15,9 +33,15 @@ const minWidth = 288;
 const minHeight = 560;
 const defaultWidth = 310;
 const defaultHeight = 600;
+const overlayAspectRatio = defaultWidth / defaultHeight;
+const maxVerticalReserve = 200;
+const maxHorizontalReserve = 80;
+const screenEdgeReserve = 20;
 
 let mode: Mode = process.argv.includes("--start-edit") ? "edit" : "interactive";
 const windows = new Map<OverlayId, BrowserWindow>();
+const lastBounds = new Map<OverlayId, Geometry>();
+const activeResizes = new Map<OverlayId, ActiveResize>();
 const overlayPayload = readOverlayPayload();
 
 if (process.platform === "linux") {
@@ -69,6 +93,34 @@ function enforceMinimumGeometry(geometry: Geometry): Geometry {
   };
 }
 
+function maxSizeForGeometry(geometry: Geometry): Pick<Geometry, "width" | "height"> {
+  const display = screen.getDisplayMatching(geometry);
+  const availableBelow = display.workArea.y + display.workArea.height - geometry.y - screenEdgeReserve;
+  const maxHeight = Math.max(
+    minHeight,
+    Math.min(display.workArea.height - maxVerticalReserve, availableBelow)
+  );
+  const maxWidth = Math.max(minWidth, display.workArea.width - maxHorizontalReserve);
+  const heightFromWidth = Math.round(maxWidth / overlayAspectRatio);
+  const height = Math.min(maxHeight, heightFromWidth);
+  return {
+    width: Math.round(height * overlayAspectRatio),
+    height
+  };
+}
+
+function clampGeometrySizeToDisplay(geometry: Geometry, anchorRight = false): Geometry {
+  const maxSize = maxSizeForGeometry(geometry);
+  const width = Math.min(Math.max(minWidth, geometry.width), maxSize.width);
+  const height = Math.min(Math.max(minHeight, geometry.height), maxSize.height);
+  return {
+    ...geometry,
+    x: anchorRight ? geometry.x + geometry.width - width : geometry.x,
+    width,
+    height
+  };
+}
+
 function writeGeometry(): void {
   const data: Partial<GeometryStore> = {};
   for (const [id, win] of windows) {
@@ -78,10 +130,102 @@ function writeGeometry(): void {
   fs.writeFileSync(geometryPath(), JSON.stringify(data, null, 2));
 }
 
+function resizeGeometry(request: ResizeRequest, activeResize: ActiveResize): Geometry {
+  const startBounds = activeResize.startBounds;
+  const dx = request.screenX - activeResize.startScreenX;
+  const dy = request.screenY - activeResize.startScreenY;
+  let width = startBounds.width;
+  let height = startBounds.height;
+  let x = startBounds.x;
+
+  if (activeResize.edge === "east") {
+    width = Math.max(minWidth, startBounds.width + dx);
+    height = Math.max(minHeight, Math.round(width / overlayAspectRatio));
+    width = Math.round(height * overlayAspectRatio);
+  } else if (activeResize.edge === "west") {
+    width = Math.max(minWidth, startBounds.width - dx);
+    height = Math.max(minHeight, Math.round(width / overlayAspectRatio));
+    width = Math.round(height * overlayAspectRatio);
+    x = startBounds.x + startBounds.width - width;
+  } else if (activeResize.edge === "south") {
+    height = Math.max(minHeight, startBounds.height + dy);
+    width = Math.max(minWidth, Math.round(height * overlayAspectRatio));
+    height = Math.round(width / overlayAspectRatio);
+  } else if (activeResize.edge === "south-east") {
+    const widthScale = (startBounds.width + dx) / startBounds.width;
+    const heightScale = (startBounds.height + dy) / startBounds.height;
+    const scale = Math.max(
+      minWidth / startBounds.width,
+      minHeight / startBounds.height,
+      widthScale,
+      heightScale
+    );
+    width = Math.max(minWidth, Math.round(startBounds.width * scale));
+    height = Math.max(minHeight, Math.round(width / overlayAspectRatio));
+    width = Math.round(height * overlayAspectRatio);
+  } else {
+    const widthScale = (startBounds.width - dx) / startBounds.width;
+    const heightScale = (startBounds.height + dy) / startBounds.height;
+    const scale = Math.max(
+      minWidth / startBounds.width,
+      minHeight / startBounds.height,
+      widthScale,
+      heightScale
+    );
+    width = Math.max(minWidth, Math.round(startBounds.width * scale));
+    height = Math.max(minHeight, Math.round(width / overlayAspectRatio));
+    width = Math.round(height * overlayAspectRatio);
+    x = startBounds.x + startBounds.width - width;
+  }
+
+  return clampGeometrySizeToDisplay({
+    x,
+    y: startBounds.y,
+    width,
+    height
+  }, activeResize.edge === "west" || activeResize.edge === "south-west");
+}
+
+function startCustomResize(request: ResizeStartRequest): void {
+  if (mode !== "edit") return;
+  const win = windows.get(request.id);
+  if (!win || win.isDestroyed()) return;
+
+  activeResizes.set(request.id, {
+    edge: request.edge,
+    startBounds: win.getBounds(),
+    startScreenX: request.startScreenX,
+    startScreenY: request.startScreenY
+  });
+}
+
+function applyCustomResize(request: ResizeRequest): void {
+  if (mode !== "edit") return;
+  const win = windows.get(request.id);
+  if (!win || win.isDestroyed()) return;
+  const activeResize = activeResizes.get(request.id);
+  if (!activeResize) return;
+
+  const bounds = resizeGeometry(request, activeResize);
+  win.setBounds(bounds);
+  win.webContents.send("debug-state", { id: request.id, mode, bounds });
+}
+
+function finishCustomResize(): void {
+  for (const [id, win] of windows) {
+    if (!win.isDestroyed()) {
+      lastBounds.set(id, win.getBounds());
+    }
+  }
+  activeResizes.clear();
+  writeGeometry();
+}
+
 function resetGeometry(): void {
   const geometry = defaultGeometry();
   for (const [id, win] of windows) {
     win.setBounds(geometry[id]);
+    lastBounds.set(id, geometry[id]);
     win.show();
     logBounds(id, win, "reset");
   }
@@ -100,7 +244,7 @@ function clampToDisplays(geometry: Geometry): Geometry {
     { minX: 0, minY: 0, maxX: 1920, maxY: 1080 }
   );
   return {
-    ...enforceMinimumGeometry(geometry),
+    ...clampGeometrySizeToDisplay(enforceMinimumGeometry(geometry)),
     x: Math.min(Math.max(geometry.x, union.minX), union.maxX - 80),
     y: Math.min(Math.max(geometry.y, union.minY), union.maxY - 80)
   };
@@ -168,6 +312,7 @@ function createOverlay(id: OverlayId, geometry: Geometry): BrowserWindow {
   });
 
   win.setAlwaysOnTop(true, "screen-saver");
+  win.setAspectRatio(overlayAspectRatio);
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   win.loadFile(path.join(__dirname, "../src/index.html"), { query: { id } });
   win.once("ready-to-show", () => {
@@ -175,6 +320,7 @@ function createOverlay(id: OverlayId, geometry: Geometry): BrowserWindow {
     logBounds(id, win, "ready-to-show");
   });
   win.webContents.once("did-finish-load", () => {
+    win.webContents.send("mode", mode);
     win.webContents.send("debug-state", { id, mode, bounds: win.getBounds() });
     win.webContents.send("overlay-payload", {
       id,
@@ -183,14 +329,15 @@ function createOverlay(id: OverlayId, geometry: Geometry): BrowserWindow {
     });
   });
   win.on("moved", () => {
+    lastBounds.set(id, win.getBounds());
     logBounds(id, win, "moved");
     writeGeometry();
   });
   win.on("resized", () => {
     logBounds(id, win, "resized");
-    writeGeometry();
   });
   windows.set(id, win);
+  lastBounds.set(id, win.getBounds());
   logBounds(id, win, "created");
   return win;
 }
@@ -198,7 +345,7 @@ function createOverlay(id: OverlayId, geometry: Geometry): BrowserWindow {
 function applyMode(next: Mode): void {
   mode = next;
   for (const [id, win] of windows) {
-    win.setResizable(mode === "edit");
+    win.setResizable(false);
     win.setIgnoreMouseEvents(mode === "passthrough", { forward: true });
     win.webContents.send("mode", mode);
     win.webContents.send("debug-state", { id, mode, bounds: win.getBounds() });
@@ -228,6 +375,11 @@ app.whenReady().then(() => {
 
   ipcMain.on("set-mode", (_event, next: Mode) => applyMode(next));
   ipcMain.on("reset-geometry", resetGeometry);
+  ipcMain.on("resize-overlay-start", (_event, request: ResizeStartRequest) =>
+    startCustomResize(request)
+  );
+  ipcMain.on("resize-overlay", (_event, request: ResizeRequest) => applyCustomResize(request));
+  ipcMain.on("resize-overlay-finished", finishCustomResize);
   applyMode(mode);
 });
 

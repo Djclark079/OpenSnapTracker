@@ -21,10 +21,15 @@
         <button data-view="deck"><span>Deck</span><strong id="counter-deck">8</strong></button>
         <button><span>Hand</span><strong id="counter-hand">4</strong></button>
         <button data-view="destroyed"><span>Destroyed</span><strong id="counter-destroyed">0</strong></button>
-        <button data-view="discarded"><span>Discard</span><strong id="counter-discarded">0</strong></button>
+        <button data-view="discarded"><span>Discarded</span><strong id="counter-discarded">0</strong></button>
         <button data-view="removed"><span>Removed</span><strong id="counter-removed">0</strong></button>
       </footer>
       <div id="tooltip" class="tooltip" hidden></div>
+      <div class="resize-handle resize-handle-west" data-resize-edge="west" title="Resize width"></div>
+      <div class="resize-handle resize-handle-east" data-resize-edge="east" title="Resize width"></div>
+      <div class="resize-handle resize-handle-south" data-resize-edge="south" title="Resize height"></div>
+      <div class="resize-handle resize-handle-corner resize-handle-corner-left" data-resize-edge="south-west" title="Resize"></div>
+      <div class="resize-handle resize-handle-corner" data-resize-edge="south-east" title="Resize"></div>
     </div>
     <script>
       const { ipcRenderer } = require("electron");
@@ -45,6 +50,8 @@
       let currentView = "deck";
       let panel = null;
       let tooltipTimer = 0;
+      let latestBounds = null;
+      let activeResize = null;
       let mode = "interactive";
 
       title.textContent = id === "player" ? "Player Deck" : "Opponent";
@@ -62,9 +69,8 @@
 
       function tooltipText(card, fallback) {
         const label = cardLabel(card, fallback);
-        const zone = card?.zone ? ` | ${card.zone}` : "";
-        const raw = card?.raw_zone ? ` | raw ${card.raw_zone}` : "";
-        return `${label}${zone}${raw}`;
+        if (label === "?") return "Unknown card";
+        return `${label}\nRules text unavailable in this replay payload.`;
       }
 
       function showTooltip(event, card, fallback) {
@@ -120,10 +126,23 @@
         counters.removed.textContent = String(panel?.counters?.removed ?? 0);
       }
 
+      function renderActiveFooterButton() {
+        document.querySelectorAll("[data-view]").forEach((button) => {
+          button.toggleAttribute("data-active", button.dataset.view === currentView);
+        });
+      }
+
+      function finishResize() {
+        if (!activeResize) return;
+        activeResize = null;
+        ipcRenderer.send("resize-overlay-finished");
+      }
+
       function render() {
         grid.innerHTML = "";
         title.textContent = viewTitle();
         renderCounters();
+        renderActiveFooterButton();
         grid.classList.toggle("zone-view", currentView !== "deck");
 
         if (panel && currentView === "deck") {
@@ -182,8 +201,54 @@
       });
       ipcRenderer.on("debug-state", (_event, state) => {
         const bounds = state.bounds;
+        latestBounds = bounds;
         debugLine.textContent = `${state.id} | ${state.mode} | ${bounds.x},${bounds.y} ${bounds.width}x${bounds.height}`;
       });
+
+      document.querySelectorAll("[data-resize-edge]").forEach((handle) => {
+        handle.addEventListener("pointerdown", (event) => {
+          if (mode !== "edit" || !latestBounds) return;
+          event.preventDefault();
+          handle.setPointerCapture(event.pointerId);
+          activeResize = {
+            edge: handle.dataset.resizeEdge,
+            pointerId: event.pointerId,
+            startScreenX: event.screenX,
+            startScreenY: event.screenY
+          };
+          ipcRenderer.send("resize-overlay-start", {
+            id,
+            edge: activeResize.edge,
+            startScreenX: activeResize.startScreenX,
+            startScreenY: activeResize.startScreenY
+          });
+        });
+        handle.addEventListener("pointermove", (event) => {
+          if (!activeResize || activeResize.pointerId !== event.pointerId) return;
+          if ((event.buttons & 1) === 0) {
+            finishResize();
+            return;
+          }
+          ipcRenderer.send("resize-overlay", {
+            id,
+            screenX: event.screenX,
+            screenY: event.screenY
+          });
+        });
+        handle.addEventListener("pointerup", (event) => {
+          if (!activeResize || activeResize.pointerId !== event.pointerId) return;
+          finishResize();
+        });
+        handle.addEventListener("pointercancel", () => {
+          finishResize();
+        });
+        handle.addEventListener("lostpointercapture", () => {
+          finishResize();
+        });
+      });
+      window.addEventListener("pointerup", finishResize);
+      window.addEventListener("pointercancel", finishResize);
+      window.addEventListener("blur", finishResize);
       render();
     </script>
   </body>

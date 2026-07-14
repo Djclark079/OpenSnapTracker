@@ -51,7 +51,7 @@ The tool:
 - Writes redacted JSON snapshots and `manifest.ndjson`.
 - Records timestamp, source filename, hash, parse status, and a generic game-state fingerprint when `/RemoteGame/GameState` exists.
 - Produces a sanitized inspection report for local captures, including turn state, player zone counts, known/hidden card counts, card zone summaries, JSON.NET `$id`/`$ref` resolution, and per-scenario transition hints.
-- Produces a sanitized replay report with conservative event counts and overlay-oriented player/opponent zone counts.
+- Produces a sanitized replay report with conservative event counts and overlay-oriented player/opponent buckets, including destroyed and discarded counts when reconciliation can classify them.
 - Stops cleanly on SIGINT.
 
 Inspection findings so far:

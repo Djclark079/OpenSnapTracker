@@ -46,7 +46,7 @@ Other raw `Graveyard` paths, transform, merge, transfer, and theft events remain
 
 ## Overlay Projection
 
-`state-reader` also exposes a lightweight overlay projection for development replay. It reports player/opponent deck, hand, board, removed, and unknown-transition counts plus known/hidden card visibility and whether an observed original-deck candidate has left the deck. This is a bridge toward the final overlay state, not the finished stable 12-slot layout model.
+`state-reader` also exposes a lightweight overlay projection for development replay. It reports player/opponent deck, hand, board, destroyed, discarded, removed, and unknown-transition counts plus known/hidden card visibility and whether an observed original-deck candidate has left the deck. A stateful projector applies reconciliation events so raw `Graveyard` cards can land in destroyed/discarded buckets when the transition is known. This is a bridge toward the final overlay state, not the finished stable 12-slot layout model.
 
 ## Desktop Shell
 

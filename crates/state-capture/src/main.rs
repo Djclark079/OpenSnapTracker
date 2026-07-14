@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use state_reader::{
-    OverlayProjection, ParticipantOverlayProjection, ReadOptions, ReconciliationInput,
-    SnapshotObservation, observe_game_state, project_overlay, read_json_snapshot,
+    OverlayProjection, OverlayProjector, ParticipantOverlayProjection, ReadOptions,
+    ReconciliationInput, SnapshotObservation, observe_game_state, read_json_snapshot,
     reconcile_observation,
 };
 use std::{
@@ -369,6 +369,7 @@ fn replay_chronological_captures(capture_dir: &Path, report: &mut String) -> Res
     snapshots.dedup_by(|left, right| left.entry.content_hash == right.entry.content_hash);
 
     let mut previous: Option<SnapshotObservation> = None;
+    let mut projector = OverlayProjector::new();
     for snapshot in snapshots {
         let value = read_json_file(&snapshot.path)?;
         let observation = observe_game_state(&value)
@@ -378,7 +379,7 @@ fn replay_chronological_captures(capture_dir: &Path, report: &mut String) -> Res
             current: &observation,
             snapshot_version: snapshot.entry.game_state_fingerprint.clone(),
         });
-        let projection = project_overlay(&observation);
+        let projection = projector.project(&observation, &events);
 
         report.push_str(&format!("Scenario: {}\n\n", snapshot.scenario));
         write_replay_step(&snapshot.entry, &observation, &events, &projection, report);
@@ -405,6 +406,7 @@ fn replay_scenario(dir: &Path, report: &mut String) -> Result<()> {
 
     let entries = read_manifest(&manifest_path)?;
     let mut previous: Option<SnapshotObservation> = None;
+    let mut projector = OverlayProjector::new();
     let mut replayed = 0usize;
 
     for entry in entries
@@ -423,7 +425,7 @@ fn replay_scenario(dir: &Path, report: &mut String) -> Result<()> {
             current: &observation,
             snapshot_version: entry.game_state_fingerprint.clone(),
         });
-        let projection = project_overlay(&observation);
+        let projection = projector.project(&observation, &events);
 
         replayed += 1;
         write_replay_step(entry, &observation, &events, &projection, report);
@@ -490,11 +492,13 @@ fn write_participant_projection(participant: &ParticipantOverlayProjection, repo
         .count();
 
     report.push_str(&format!(
-        "- {:?}: deck={} hand={} board={} removed={} unknown_transition={} cards={} known={} hidden={} consumed_original={}\n",
+        "- {:?}: deck={} hand={} board={} destroyed={} discarded={} removed={} unknown_transition={} cards={} known={} hidden={} consumed_original={}\n",
         participant.participant,
         participant.deck_count,
         participant.hand_count,
         participant.board_count,
+        participant.destroyed_count,
+        participant.discarded_count,
         participant.removed_count,
         participant.unknown_transition_count,
         participant.cards.len(),
@@ -1235,7 +1239,7 @@ mod tests {
 
         assert!(report.contains("card_drawn=1"));
         assert!(report.contains("card_revealed=1"));
-        assert!(report.contains("Player: deck=0 hand=2"));
-        assert!(report.contains("Opponent: deck=1 hand=1"));
+        assert!(report.contains("Player: deck=0 hand=2 board=0 destroyed=0 discarded=0"));
+        assert!(report.contains("Opponent: deck=1 hand=1 board=0 destroyed=0 discarded=0"));
     }
 }

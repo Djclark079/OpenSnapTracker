@@ -6,7 +6,7 @@
 
 use domain::{
     CardInstance, CardInstanceId, CardKey, CardKnowledge, CardOrigin, MatchEvent, MatchLifecycle,
-    Participant, Provenance, Zone,
+    Participant, Provenance, RemovalReason, Zone,
 };
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, fs, io, path::Path, thread, time::Duration};
@@ -211,6 +211,8 @@ pub struct ParticipantOverlayProjection {
     pub deck_count: usize,
     pub hand_count: usize,
     pub board_count: usize,
+    pub destroyed_count: usize,
+    pub discarded_count: usize,
     pub removed_count: usize,
     pub unknown_transition_count: usize,
     pub cards: Vec<OverlayCardProjection>,
@@ -225,6 +227,51 @@ pub struct OverlayCardProjection {
     pub raw_zone: Option<String>,
     pub original_deck_candidate: bool,
     pub consumed_from_deck: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OverlayProjector {
+    classified_zones: HashMap<CardInstanceId, Zone>,
+}
+
+impl OverlayProjector {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn project(
+        &mut self,
+        observation: &SnapshotObservation,
+        events: &[MatchEvent],
+    ) -> OverlayProjection {
+        self.apply_events(events);
+        project_overlay_with_classifications(observation, &self.classified_zones)
+    }
+
+    fn apply_events(&mut self, events: &[MatchEvent]) {
+        for event in events {
+            match event {
+                MatchEvent::CardDestroyed { card } => {
+                    self.classified_zones.insert(card.clone(), Zone::Destroyed);
+                }
+                MatchEvent::CardDiscarded { card } => {
+                    self.classified_zones.insert(card.clone(), Zone::Discarded);
+                }
+                MatchEvent::CardRemoved { card, reason } => {
+                    self.classified_zones
+                        .insert(card.clone(), zone_for_removal_reason(*reason));
+                }
+                MatchEvent::CardReturned { card, .. }
+                | MatchEvent::CardDrawn { card }
+                | MatchEvent::CardPlayed { card } => {
+                    self.classified_zones.remove(card);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -294,8 +341,7 @@ pub fn observe_game_state(
         .any(|card| card.raw_zone.as_deref() == Some("Graveyard"))
     {
         warnings.push(
-            "raw Graveyard zone observed; destroyed/discarded semantics require transition context"
-                .to_string(),
+            "raw Graveyard zone observed; unusual paths require transition context".to_string(),
         );
     }
 
@@ -497,12 +543,19 @@ fn should_reset_reconciliation(previous: MatchLifecycle, current: MatchLifecycle
 
 #[must_use]
 pub fn project_overlay(observation: &SnapshotObservation) -> OverlayProjection {
+    project_overlay_with_classifications(observation, &HashMap::new())
+}
+
+fn project_overlay_with_classifications(
+    observation: &SnapshotObservation,
+    classified_zones: &HashMap<CardInstanceId, Zone>,
+) -> OverlayProjection {
     OverlayProjection {
         lifecycle: observation.lifecycle,
         turn: observation.turn,
         total_turns: observation.total_turns,
-        player: project_participant(observation, Participant::Player),
-        opponent: project_participant(observation, Participant::Opponent),
+        player: project_participant(observation, Participant::Player, classified_zones),
+        opponent: project_participant(observation, Participant::Opponent, classified_zones),
         warnings: observation.warnings.clone(),
     }
 }
@@ -510,6 +563,7 @@ pub fn project_overlay(observation: &SnapshotObservation) -> OverlayProjection {
 fn project_participant(
     observation: &SnapshotObservation,
     participant: Participant,
+    classified_zones: &HashMap<CardInstanceId, Zone>,
 ) -> ParticipantOverlayProjection {
     let deck_count = zone_count(observation, participant, "Deck");
     let hand_count = zone_count(observation, participant, "Hand");
@@ -519,18 +573,20 @@ fn project_participant(
         .filter(|card| card.owner == participant)
         .map(|card| {
             let original_deck_candidate = card.started_in_deck_entity_id.is_some();
+            let instance_id = card_instance_id(card.entity_id);
+            let zone = effective_projection_zone(card, &instance_id, classified_zones);
             OverlayCardProjection {
-                instance_id: card_instance_id(card.entity_id),
+                instance_id,
                 card_definition_key: card.card_definition_key.clone(),
                 knowledge: if card.is_known() {
                     CardKnowledge::KnownCard
                 } else {
                     CardKnowledge::UnknownCard
                 },
-                zone: card.domain_zone,
+                zone,
                 raw_zone: card.raw_zone.clone(),
                 original_deck_candidate,
-                consumed_from_deck: original_deck_candidate && card.domain_zone != Zone::Deck,
+                consumed_from_deck: original_deck_candidate && zone != Zone::Deck,
             }
         })
         .collect::<Vec<_>>();
@@ -545,6 +601,14 @@ fn project_participant(
         deck_count,
         hand_count,
         board_count: cards.iter().filter(|card| card.zone == Zone::Board).count(),
+        destroyed_count: cards
+            .iter()
+            .filter(|card| card.zone == Zone::Destroyed)
+            .count(),
+        discarded_count: cards
+            .iter()
+            .filter(|card| card.zone == Zone::Discarded)
+            .count(),
         removed_count: cards
             .iter()
             .filter(|card| card.zone == Zone::RemovedConfirmed)
@@ -554,6 +618,31 @@ fn project_participant(
             .filter(|card| card.zone == Zone::UnknownTransition)
             .count(),
         cards,
+    }
+}
+
+fn effective_projection_zone(
+    card: &CardObservation,
+    instance_id: &CardInstanceId,
+    classified_zones: &HashMap<CardInstanceId, Zone>,
+) -> Zone {
+    if card.raw_zone.as_deref() == Some("Graveyard")
+        && let Some(zone) = classified_zones.get(instance_id).copied()
+    {
+        return zone;
+    }
+    card.domain_zone
+}
+
+fn zone_for_removal_reason(reason: RemovalReason) -> Zone {
+    match reason {
+        RemovalReason::Destroyed => Zone::Destroyed,
+        RemovalReason::Discarded => Zone::Discarded,
+        RemovalReason::RemovedConfirmed => Zone::RemovedConfirmed,
+        RemovalReason::Transformed => Zone::Transformed,
+        RemovalReason::Merged => Zone::Merged,
+        RemovalReason::Returned => Zone::Returned,
+        RemovalReason::UnknownTransition => Zone::UnknownTransition,
     }
 }
 
@@ -1184,6 +1273,73 @@ mod tests {
                 && card.card_definition_key == Some(CardKey("Daken".to_string()))
                 && card.zone == Zone::Board
                 && card.consumed_from_deck
+        }));
+    }
+
+    #[test]
+    fn stateful_projection_buckets_destroyed_and_discarded_cards() {
+        let active: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-active-turn.json"
+        ))
+        .expect("active fixture parses");
+        let discarded: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-discard-after.json"
+        ))
+        .expect("discard fixture parses");
+        let board: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-transition-after.json"
+        ))
+        .expect("board fixture parses");
+        let destroyed: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-graveyard-after.json"
+        ))
+        .expect("destroy fixture parses");
+
+        let active = observe_game_state(&active).expect("observes active");
+        let discarded = observe_game_state(&discarded).expect("observes discarded");
+        let board = observe_game_state(&board).expect("observes board");
+        let destroyed = observe_game_state(&destroyed).expect("observes destroyed");
+
+        let mut projector = OverlayProjector::new();
+        let initial_events = reconcile_observation(ReconciliationInput {
+            previous: None,
+            current: &active,
+            snapshot_version: None,
+        });
+        let _ = projector.project(&active, &initial_events);
+        let discard_events = reconcile_observation(ReconciliationInput {
+            previous: Some(&active),
+            current: &discarded,
+            snapshot_version: None,
+        });
+        let discard_projection = projector.project(&discarded, &discard_events);
+
+        assert_eq!(discard_projection.player.discarded_count, 1);
+        assert_eq!(discard_projection.player.destroyed_count, 0);
+        assert!(discard_projection.player.cards.iter().any(|card| {
+            card.instance_id == CardInstanceId("game:21".to_string())
+                && card.zone == Zone::Discarded
+        }));
+
+        let mut projector = OverlayProjector::new();
+        let board_events = reconcile_observation(ReconciliationInput {
+            previous: None,
+            current: &board,
+            snapshot_version: None,
+        });
+        let _ = projector.project(&board, &board_events);
+        let destroy_events = reconcile_observation(ReconciliationInput {
+            previous: Some(&board),
+            current: &destroyed,
+            snapshot_version: None,
+        });
+        let destroy_projection = projector.project(&destroyed, &destroy_events);
+
+        assert_eq!(destroy_projection.opponent.destroyed_count, 1);
+        assert_eq!(destroy_projection.opponent.discarded_count, 0);
+        assert!(destroy_projection.opponent.cards.iter().any(|card| {
+            card.instance_id == CardInstanceId("game:31".to_string())
+                && card.zone == Zone::Destroyed
         }));
     }
 }

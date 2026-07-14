@@ -701,6 +701,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracker-sidecar"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "serde_json",
+ "state-reader",
+ "tempfile",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

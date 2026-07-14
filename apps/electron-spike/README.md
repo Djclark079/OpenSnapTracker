@@ -39,6 +39,20 @@ You can also pass another payload path:
 env OST_OVERLAY_PAYLOAD=/path/to/overlay.json npm run start:kde-x11
 ```
 
+Run against live Marvel Snap state files with the Rust sidecar:
+
+```sh
+env OST_LIVE_STATE_DIR="$HOME/.steam/steam/steamapps/compatdata/1997040/pfx/drive_c/users/steamuser/AppData/LocalLow/Second Dinner/SNAP/Standalone/States/nvprod" npm run start:live
+```
+
+For fish:
+
+```fish
+env OST_LIVE_STATE_DIR="$HOME/.steam/steam/steamapps/compatdata/1997040/pfx/drive_c/users/steamuser/AppData/LocalLow/Second Dinner/SNAP/Standalone/States/nvprod" npm run start:live
+```
+
+The live mode starts `cargo run -p tracker-sidecar` in development, writes a derived overlay payload under Electron's user-data directory, and reloads both overlay windows whenever that payload changes.
+
 Hotkeys:
 - `Ctrl+Shift+P`: toggle passthrough.
 - `Ctrl+Shift+E`: toggle edit mode.

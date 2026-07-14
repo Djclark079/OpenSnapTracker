@@ -10,6 +10,7 @@
     "start:x11": "npm run build && env XDG_SESSION_TYPE=x11 electron . --ozone-platform=x11 --force-device-scale-factor=1 --disable-gpu",
     "start:kde-x11": "npm run build && env XDG_SESSION_TYPE=x11 electron . --ozone-platform=x11 --disable-gpu --reset-geometry --start-edit",
     "start:payload": "npm run build && env XDG_SESSION_TYPE=x11 OST_OVERLAY_PAYLOAD=../../captures/_derived/overlay.json electron . --ozone-platform=x11 --disable-gpu --reset-geometry --start-edit",
+    "start:live": "npm run build && env XDG_SESSION_TYPE=x11 electron . --ozone-platform=x11 --disable-gpu --reset-geometry --start-edit",
     "package:appimage": "npm run build && electron-builder --linux AppImage"
   },
   "devDependencies": {

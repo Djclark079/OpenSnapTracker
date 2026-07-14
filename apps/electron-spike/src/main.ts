@@ -1,6 +1,7 @@
 import { app, BrowserWindow, globalShortcut, ipcMain, screen } from "electron";
 import path from "node:path";
 import fs from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
 
 type OverlayId = "player" | "opponent";
 type Mode = "interactive" | "passthrough" | "edit";
@@ -42,7 +43,9 @@ let mode: Mode = process.argv.includes("--start-edit") ? "edit" : "interactive";
 const windows = new Map<OverlayId, BrowserWindow>();
 const lastBounds = new Map<OverlayId, Geometry>();
 const activeResizes = new Map<OverlayId, ActiveResize>();
-const overlayPayload = readOverlayPayload();
+let overlayPayload: OverlayPayload | null = null;
+let sidecar: ChildProcess | null = null;
+let overlayPayloadWatchPath: string | null = null;
 
 if (process.platform === "linux") {
   app.disableHardwareAcceleration();
@@ -265,13 +268,24 @@ function overlayPayloadPath(): string | undefined {
   return fromArg || process.env.OST_OVERLAY_PAYLOAD;
 }
 
+function liveStateDir(): string | undefined {
+  const arg = process.argv.find((value) => value.startsWith("--live-state-dir="));
+  const fromArg = arg?.slice("--live-state-dir=".length);
+  return fromArg || process.env.OST_LIVE_STATE_DIR;
+}
+
+function defaultLivePayloadPath(): string {
+  return path.join(app.getPath("userData"), "live-overlay.json");
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function readOverlayPayload(): OverlayPayload | null {
-  const payloadPath = overlayPayloadPath();
+  const payloadPath = overlayPayloadWatchPath ?? overlayPayloadPath();
   if (!payloadPath) return null;
+  if (!fs.existsSync(payloadPath)) return null;
 
   try {
     const parsed: unknown = JSON.parse(fs.readFileSync(payloadPath, "utf8"));
@@ -289,6 +303,66 @@ function readOverlayPayload(): OverlayPayload | null {
 
 function payloadPanel(id: OverlayId): unknown {
   return overlayPayload?.[id] ?? null;
+}
+
+function broadcastOverlayPayload(): void {
+  for (const [id, win] of windows) {
+    if (win.isDestroyed()) continue;
+    win.webContents.send("overlay-payload", {
+      id,
+      panel: payloadPanel(id),
+      sourcePath: overlayPayloadWatchPath ?? overlayPayloadPath() ?? null
+    });
+  }
+}
+
+function reloadOverlayPayload(): void {
+  const next = readOverlayPayload();
+  if (!next) return;
+  overlayPayload = next;
+  broadcastOverlayPayload();
+}
+
+function startOverlayPayloadWatcher(): void {
+  const payloadPath = overlayPayloadWatchPath ?? overlayPayloadPath();
+  if (!payloadPath) return;
+  overlayPayloadWatchPath = payloadPath;
+  overlayPayload = readOverlayPayload();
+  fs.watchFile(payloadPath, { interval: 250 }, (current, previous) => {
+    if (current.mtimeMs !== previous.mtimeMs || current.size !== previous.size) {
+      reloadOverlayPayload();
+    }
+  });
+}
+
+function startTrackerSidecar(): void {
+  const stateDir = liveStateDir();
+  if (!stateDir) return;
+  const outputJson = overlayPayloadPath() ?? defaultLivePayloadPath();
+  overlayPayloadWatchPath = outputJson;
+  sidecar = spawn(
+    "cargo",
+    [
+      "run",
+      "-p",
+      "tracker-sidecar",
+      "--",
+      "--state-dir",
+      stateDir,
+      "--output-json",
+      outputJson,
+      "--interval-ms",
+      "250"
+    ],
+    {
+      cwd: path.resolve(__dirname, "../../.."),
+      stdio: "inherit"
+    }
+  );
+  sidecar.on("exit", (code, signal) => {
+    console.log("[overlay-spike] tracker sidecar exited", { code, signal });
+    sidecar = null;
+  });
 }
 
 function createOverlay(id: OverlayId, geometry: Geometry): BrowserWindow {
@@ -355,6 +429,8 @@ function applyMode(next: Mode): void {
 
 app.whenReady().then(() => {
   console.log("[overlay-spike] displays", screen.getAllDisplays().map((display) => display.bounds));
+  startTrackerSidecar();
+  startOverlayPayloadWatcher();
   const geometry = readGeometry(defaultGeometry());
   createOverlay("player", geometry.player);
   createOverlay("opponent", geometry.opponent);
@@ -384,6 +460,12 @@ app.whenReady().then(() => {
 });
 
 app.on("will-quit", () => {
+  if (overlayPayloadWatchPath) {
+    fs.unwatchFile(overlayPayloadWatchPath);
+  }
+  if (sidecar && !sidecar.killed) {
+    sidecar.kill();
+  }
   writeGeometry();
   globalShortcut.unregisterAll();
 });

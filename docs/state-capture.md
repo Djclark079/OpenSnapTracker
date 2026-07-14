@@ -44,6 +44,14 @@ Export the final replay projection as a text-only overlay payload:
 cargo run -p state-capture -- --replay-captures captures --replay-chronological --export-overlay-json captures/_derived/overlay.json
 ```
 
+Run the live read-only tracker sidecar:
+
+```sh
+cargo run -p tracker-sidecar -- --state-dir <state-dir> --output-json /tmp/opensnaptracker-live-overlay.json
+```
+
+The sidecar reads `GameState.json`, skips unchanged file hashes, reconciles against the previous observed snapshot, and atomically writes the same text-only overlay payload used by the Electron spike.
+
 Optional redaction uses dotted JSON paths:
 
 ```sh
@@ -59,6 +67,7 @@ The tool:
 - Produces a sanitized inspection report for local captures, including turn state, player zone counts, known/hidden card counts, card zone summaries, JSON.NET `$id`/`$ref` resolution, and per-scenario transition hints.
 - Produces a sanitized replay report with conservative event counts and overlay-oriented player/opponent buckets, including destroyed and discarded counts when reconciliation can classify them.
 - Can export a sanitized text-only overlay payload for development UI rendering. The payload uses fixed 12-slot player/opponent panels, text labels for known cards, `?` placeholders for unknown slots, and separate supplemental/destroyed/discarded/removed/unknown-transition collections.
+- Includes a live sidecar that emits derived overlay payload JSON from local game state without modifying game files.
 - Stops cleanly on SIGINT.
 
 Inspection findings so far:

@@ -5,6 +5,7 @@ members = [
     "crates/image-cache",
     "crates/metadata-client",
     "crates/state-capture",
+    "crates/tracker-sidecar",
     "crates/state-reader",
     "crates/storage",
 ]

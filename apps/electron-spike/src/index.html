@@ -23,6 +23,7 @@
         <button data-view="destroyed"><span>Destroyed</span><strong id="counter-destroyed">0</strong></button>
         <button data-view="discarded"><span>Discarded</span><strong id="counter-discarded">0</strong></button>
         <button data-view="removed"><span>Removed</span><strong id="counter-removed">0</strong></button>
+        <button data-view="supplemental"><span>Extra</span><strong id="counter-supplemental">0</strong></button>
       </footer>
       <div id="tooltip" class="tooltip" hidden></div>
       <div class="resize-handle resize-handle-west" data-resize-edge="west" title="Resize width"></div>
@@ -45,7 +46,8 @@
         hand: document.getElementById("counter-hand"),
         destroyed: document.getElementById("counter-destroyed"),
         discarded: document.getElementById("counter-discarded"),
-        removed: document.getElementById("counter-removed")
+        removed: document.getElementById("counter-removed"),
+        supplemental: document.getElementById("counter-supplemental")
       };
       let currentView = "deck";
       let panel = null;
@@ -129,6 +131,7 @@
         counters.destroyed.textContent = String(panel?.counters?.destroyed ?? 0);
         counters.discarded.textContent = String(panel?.counters?.discarded ?? 0);
         counters.removed.textContent = String(panel?.counters?.removed ?? 0);
+        counters.supplemental.textContent = String(panel?.counters?.supplemental ?? 0);
       }
 
       function renderActiveFooterButton() {

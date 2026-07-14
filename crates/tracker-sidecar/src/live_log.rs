@@ -7,6 +7,9 @@ pub enum LiveLogEvent {
     PlayerDrew {
         key: CardKey,
     },
+    PlayerHandObserved {
+        key: CardKey,
+    },
     PlayerStaged {
         key: CardKey,
         entity_id: Option<String>,
@@ -32,6 +35,7 @@ pub struct LiveLogState {
     player_supplemental: Vec<CardKey>,
     player_destroyed: Vec<CardKey>,
     opponent_known: Vec<CardKey>,
+    opponent_consumed_keys: HashSet<CardKey>,
     staged_by_entity: HashMap<String, CardKey>,
     recently_player_resolved: HashSet<CardKey>,
 }
@@ -48,6 +52,10 @@ impl LiveLogState {
         match event {
             LiveLogEvent::PlayerDrew { key } => {
                 self.record_player_card_seen(key, "draw");
+                true
+            }
+            LiveLogEvent::PlayerHandObserved { key } => {
+                self.record_player_card_seen(key, "hand-observed");
                 true
             }
             LiveLogEvent::PlayerStaged {
@@ -79,6 +87,7 @@ impl LiveLogState {
                 if self.recently_player_resolved.remove(&key) {
                     return true;
                 }
+                self.opponent_consumed_keys.insert(key.clone());
                 push_unique(&mut self.opponent_known, key);
                 true
             }
@@ -145,6 +154,19 @@ impl LiveLogState {
         payload.player.counters.destroyed = payload.player.destroyed.len();
 
         for key in &self.opponent_known {
+            if let Some(card) = payload
+                .opponent
+                .deck_slots
+                .iter_mut()
+                .filter_map(|slot| slot.card.as_mut())
+                .find(|card| card.card_definition_key.as_ref() == Some(key))
+            {
+                if self.opponent_consumed_keys.contains(key) {
+                    card.consumed_from_deck = true;
+                    card.zone = Zone::Board;
+                }
+                continue;
+            }
             if payload.opponent.deck_slots.iter().any(|slot| {
                 slot.card
                     .as_ref()
@@ -165,8 +187,8 @@ impl LiveLogState {
                     "player-log:opponent",
                     index,
                     key,
-                    Zone::Deck,
-                    false,
+                    Zone::Board,
+                    true,
                 ));
             }
         }
@@ -188,6 +210,7 @@ impl LiveLogState {
         self.player_supplemental.clear();
         self.player_destroyed.clear();
         self.opponent_known.clear();
+        self.opponent_consumed_keys.clear();
         self.staged_by_entity.clear();
         self.recently_player_resolved.clear();
     }
@@ -199,6 +222,11 @@ pub fn parse_live_log_line(line: &str) -> Option<LiveLogEvent> {
     }
     if line.contains("|DrawCard") {
         return parse_card_vfx_key(line).map(|key| LiveLogEvent::PlayerDrew {
+            key: CardKey(key.to_string()),
+        });
+    }
+    if line.contains("|HighlightCardPlayable") {
+        return parse_card_vfx_key(line).map(|key| LiveLogEvent::PlayerHandObserved {
             key: CardKey(key.to_string()),
         });
     }
@@ -296,6 +324,14 @@ mod tests {
         );
         assert_eq!(
             parse_live_log_line(
+                "<color=#9AECFF><b>GameVfxManager</b></color> | LoadVfxDef|Start|CardVfxDefs/Sentinel.asset|HighlightCardPlayable"
+            ),
+            Some(LiveLogEvent::PlayerHandObserved {
+                key: CardKey("Sentinel".to_string())
+            })
+        );
+        assert_eq!(
+            parse_live_log_line(
                 "OnStageEntityResponse|ClientStageRequest | CurrentState = Pending| Turn = 6| CardEntityId = 18| SourceZoneEntityId = 9| Undo = False|StageEntityResponse | Accepted = True"
             ),
             Some(LiveLogEvent::PlayerStageAccepted {
@@ -337,6 +373,21 @@ mod tests {
     }
 
     #[test]
+    fn hand_observed_non_deck_cards_are_supplemental() {
+        let mut state = LiveLogState::default();
+        state.set_player_deck([CardKey("Korg".to_string())]);
+
+        state.apply(LiveLogEvent::PlayerHandObserved {
+            key: CardKey("Sentinel".to_string()),
+        });
+
+        assert_eq!(
+            state.player_supplemental,
+            vec![CardKey("Sentinel".to_string())]
+        );
+    }
+
+    #[test]
     fn opponent_resolved_cards_are_stably_recorded_once() {
         let mut state = LiveLogState::default();
         state.apply(LiveLogEvent::CardResolved {
@@ -349,6 +400,11 @@ mod tests {
         assert_eq!(
             state.opponent_known,
             vec![CardKey("MistyKnight".to_string())]
+        );
+        assert!(
+            state
+                .opponent_consumed_keys
+                .contains(&CardKey("MistyKnight".to_string()))
         );
     }
 }

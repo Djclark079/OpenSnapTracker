@@ -18,11 +18,11 @@
       <div id="debug-line" class="debug-line"></div>
       <main id="grid" class="grid"></main>
       <footer>
-        <button><span>Deck</span><strong>8</strong></button>
-        <button><span>Hand</span><strong>4</strong></button>
-        <button id="zone-button">Destroyed <span>0</span></button>
-        <button><span>Discard</span><strong>0</strong></button>
-        <button><span>Removed</span><strong>0</strong></button>
+        <button data-view="deck"><span>Deck</span><strong id="counter-deck">8</strong></button>
+        <button><span>Hand</span><strong id="counter-hand">4</strong></button>
+        <button data-view="destroyed"><span>Destroyed</span><strong id="counter-destroyed">0</strong></button>
+        <button data-view="discarded"><span>Discard</span><strong id="counter-discarded">0</strong></button>
+        <button data-view="removed"><span>Removed</span><strong id="counter-removed">0</strong></button>
       </footer>
       <div id="tooltip" class="tooltip" hidden></div>
     </div>
@@ -35,33 +35,125 @@
       const tooltip = document.getElementById("tooltip");
       const debugBadge = document.getElementById("debug-badge");
       const debugLine = document.getElementById("debug-line");
-      let zone = false;
+      const counters = {
+        deck: document.getElementById("counter-deck"),
+        hand: document.getElementById("counter-hand"),
+        destroyed: document.getElementById("counter-destroyed"),
+        discarded: document.getElementById("counter-discarded"),
+        removed: document.getElementById("counter-removed")
+      };
+      let currentView = "deck";
+      let panel = null;
+      let tooltipTimer = 0;
+      let mode = "interactive";
 
       title.textContent = id === "player" ? "Player Deck" : "Opponent";
       debugBadge.textContent = id.toUpperCase();
       document.body.dataset.overlayId = id;
 
+      function viewTitle() {
+        if (currentView === "deck") return panel?.title || (id === "player" ? "Player Deck" : "Opponent");
+        return currentView.charAt(0).toUpperCase() + currentView.slice(1);
+      }
+
+      function cardLabel(card, fallback) {
+        return card?.label || fallback;
+      }
+
+      function tooltipText(card, fallback) {
+        const label = cardLabel(card, fallback);
+        const zone = card?.zone ? ` | ${card.zone}` : "";
+        const raw = card?.raw_zone ? ` | raw ${card.raw_zone}` : "";
+        return `${label}${zone}${raw}`;
+      }
+
+      function showTooltip(event, card, fallback) {
+        if (mode === "passthrough") return;
+        clearTimeout(tooltipTimer);
+        tooltipTimer = setTimeout(() => {
+          tooltip.textContent = tooltipText(card, fallback);
+          tooltip.hidden = false;
+          const offset = 12;
+          tooltip.style.left = `${event.clientX + offset}px`;
+          tooltip.style.top = `${event.clientY + offset}px`;
+          requestAnimationFrame(() => {
+            const rect = tooltip.getBoundingClientRect();
+            const left = Math.max(6, Math.min(event.clientX + offset, window.innerWidth - rect.width - 6));
+            const top = Math.max(6, Math.min(event.clientY + offset, window.innerHeight - rect.height - 6));
+            tooltip.style.left = `${left}px`;
+            tooltip.style.top = `${top}px`;
+          });
+        }, 250);
+      }
+
+      function hideTooltip() {
+        clearTimeout(tooltipTimer);
+        tooltip.hidden = true;
+      }
+
+      function makeCard(card, fallback, unknown = false) {
+        const button = document.createElement("button");
+        button.className = "card";
+        if (unknown || card?.knowledge === "unknown_card") button.classList.add("unknown");
+        if (card?.consumed_from_deck) button.classList.add("consumed");
+        const label = document.createElement("span");
+        label.className = "card-label";
+        label.textContent = cardLabel(card, fallback);
+        button.appendChild(label);
+        button.addEventListener("mouseenter", (event) => showTooltip(event, card, fallback));
+        button.addEventListener("mousemove", (event) => {
+          if (!tooltip.hidden) {
+            const offset = 12;
+            tooltip.style.left = `${Math.min(event.clientX + offset, window.innerWidth - tooltip.offsetWidth - 6)}px`;
+            tooltip.style.top = `${Math.min(event.clientY + offset, window.innerHeight - tooltip.offsetHeight - 6)}px`;
+          }
+        });
+        button.addEventListener("mouseleave", hideTooltip);
+        return button;
+      }
+
+      function renderCounters() {
+        counters.deck.textContent = String(panel?.counters?.deck ?? 8);
+        counters.hand.textContent = String(panel?.counters?.hand ?? 4);
+        counters.destroyed.textContent = String(panel?.counters?.destroyed ?? 0);
+        counters.discarded.textContent = String(panel?.counters?.discarded ?? 0);
+        counters.removed.textContent = String(panel?.counters?.removed ?? 0);
+      }
+
       function render() {
         grid.innerHTML = "";
+        title.textContent = viewTitle();
+        renderCounters();
+        grid.classList.toggle("zone-view", currentView !== "deck");
+
+        if (panel && currentView === "deck") {
+          for (const slot of panel.deck_slots || []) {
+            grid.appendChild(makeCard(slot.card, slot.state === "unknown" ? "?" : String(slot.slot_index + 1), slot.state === "unknown"));
+          }
+          return;
+        }
+
+        if (panel && currentView !== "deck") {
+          const cards = panel[currentView] || [];
+          if (cards.length === 0) {
+            const empty = document.createElement("div");
+            empty.className = "empty-zone";
+            empty.textContent = "No cards";
+            grid.appendChild(empty);
+            return;
+          }
+          for (const card of cards) grid.appendChild(makeCard(card, "?"));
+          return;
+        }
+
         for (let i = 0; i < 12; i += 1) {
-          const card = document.createElement("button");
-          card.className = "card";
-          if (id === "opponent" && i > 4) card.classList.add("unknown");
-          if (i === 1 || i === 6) card.classList.add("consumed");
-          card.textContent = id === "opponent" && i > 4 ? "?" : String(i + 1);
-          card.addEventListener("mouseenter", () => {
-            window.tooltipTimer = setTimeout(() => {
-              tooltip.textContent = `Placeholder ${i + 1} | Cost ${i % 6} | Power ${(i + 1) % 10} | Canonical ability text`;
-              tooltip.hidden = false;
-              tooltip.style.left = "8px";
-              tooltip.style.top = "44px";
-            }, 250);
-          });
-          card.addEventListener("mouseleave", () => {
-            clearTimeout(window.tooltipTimer);
-            tooltip.hidden = true;
-          });
-          grid.appendChild(card);
+          const unknown = id === "opponent" && i > 4;
+          const card = {
+            label: unknown ? "?" : String(i + 1),
+            knowledge: unknown ? "unknown_card" : "known_card",
+            consumed_from_deck: i === 1 || i === 6
+          };
+          grid.appendChild(makeCard(card, card.label, unknown));
         }
       }
 
@@ -69,14 +161,24 @@
         button.addEventListener("click", () => ipcRenderer.send("set-mode", button.dataset.mode));
       });
       document.getElementById("reset-button").addEventListener("click", () => ipcRenderer.send("reset-geometry"));
-      document.getElementById("zone-button").addEventListener("click", () => {
-        zone = !zone;
-        title.textContent = zone ? "Destroyed" : id === "player" ? "Player Deck" : "Opponent";
+      document.querySelectorAll("[data-view]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const next = button.dataset.view;
+          currentView = currentView === next ? "deck" : next;
+          hideTooltip();
+          render();
+        });
+      });
+      ipcRenderer.on("overlay-payload", (_event, payload) => {
+        panel = payload.panel;
+        debugBadge.textContent = panel ? `${id.toUpperCase()} DATA` : id.toUpperCase();
+        currentView = "deck";
         render();
       });
-      ipcRenderer.on("mode", (_event, mode) => {
+      ipcRenderer.on("mode", (_event, nextMode) => {
+        mode = nextMode;
         document.body.dataset.mode = mode;
-        if (mode === "passthrough") tooltip.hidden = true;
+        if (mode === "passthrough") hideTooltip();
       });
       ipcRenderer.on("debug-state", (_event, state) => {
         const bounds = state.bounds;

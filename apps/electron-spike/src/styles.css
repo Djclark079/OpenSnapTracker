@@ -85,21 +85,47 @@ strong {
 }
 
 .card {
+  display: grid;
+  place-items: center;
   min-width: 0;
   min-height: 0;
   border: 1px solid rgba(255, 255, 255, 0.35);
   background: linear-gradient(150deg, #244a69, #7b3359);
   font-weight: 800;
-  font-size: 23px;
+  font-size: 14px;
+  line-height: 1.05;
+  padding: 4px;
   overflow: hidden;
+}
+
+.card-label {
+  max-width: 100%;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  text-align: center;
 }
 
 .card.unknown {
   background: linear-gradient(150deg, #362947, #6f5780);
+  font-size: 23px;
 }
 
 .card.consumed {
   filter: grayscale(1) brightness(0.45);
+}
+
+.zone-view {
+  grid-template-rows: none;
+  grid-auto-rows: minmax(82px, 1fr);
+  overflow-y: auto;
+}
+
+.empty-zone {
+  grid-column: 1 / -1;
+  align-self: center;
+  justify-self: center;
+  color: rgba(247, 244, 255, 0.68);
+  font-size: 13px;
 }
 
 footer {

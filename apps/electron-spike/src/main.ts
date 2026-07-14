@@ -6,6 +6,10 @@ type OverlayId = "player" | "opponent";
 type Mode = "interactive" | "passthrough" | "edit";
 type Geometry = { x: number; y: number; width: number; height: number };
 type GeometryStore = Record<OverlayId, Geometry>;
+type OverlayPayload = Record<string, unknown> & {
+  player?: unknown;
+  opponent?: unknown;
+};
 
 const minWidth = 288;
 const minHeight = 560;
@@ -14,6 +18,7 @@ const defaultHeight = 600;
 
 let mode: Mode = process.argv.includes("--start-edit") ? "edit" : "interactive";
 const windows = new Map<OverlayId, BrowserWindow>();
+const overlayPayload = readOverlayPayload();
 
 if (process.platform === "linux") {
   app.disableHardwareAcceleration();
@@ -110,6 +115,38 @@ function logBounds(id: OverlayId, win: BrowserWindow, event: string): void {
   });
 }
 
+function overlayPayloadPath(): string | undefined {
+  const arg = process.argv.find((value) => value.startsWith("--overlay-payload="));
+  const fromArg = arg?.slice("--overlay-payload=".length);
+  return fromArg || process.env.OST_OVERLAY_PAYLOAD;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readOverlayPayload(): OverlayPayload | null {
+  const payloadPath = overlayPayloadPath();
+  if (!payloadPath) return null;
+
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(payloadPath, "utf8"));
+    if (!isRecord(parsed) || !isRecord(parsed.player) || !isRecord(parsed.opponent)) {
+      console.warn("[overlay-spike] ignored overlay payload with unexpected shape", payloadPath);
+      return null;
+    }
+    console.log("[overlay-spike] loaded overlay payload", payloadPath);
+    return parsed as OverlayPayload;
+  } catch (error) {
+    console.warn("[overlay-spike] could not load overlay payload", payloadPath, error);
+    return null;
+  }
+}
+
+function payloadPanel(id: OverlayId): unknown {
+  return overlayPayload?.[id] ?? null;
+}
+
 function createOverlay(id: OverlayId, geometry: Geometry): BrowserWindow {
   const win = new BrowserWindow({
     ...clampToDisplays(geometry),
@@ -139,6 +176,11 @@ function createOverlay(id: OverlayId, geometry: Geometry): BrowserWindow {
   });
   win.webContents.once("did-finish-load", () => {
     win.webContents.send("debug-state", { id, mode, bounds: win.getBounds() });
+    win.webContents.send("overlay-payload", {
+      id,
+      panel: payloadPanel(id),
+      sourcePath: overlayPayloadPath() ?? null
+    });
   });
   win.on("moved", () => {
     logBounds(id, win, "moved");

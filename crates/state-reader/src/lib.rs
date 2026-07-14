@@ -195,6 +195,38 @@ pub struct ReconciliationInput<'a> {
     pub snapshot_version: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OverlayProjection {
+    pub lifecycle: MatchLifecycle,
+    pub turn: Option<i64>,
+    pub total_turns: Option<i64>,
+    pub player: ParticipantOverlayProjection,
+    pub opponent: ParticipantOverlayProjection,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParticipantOverlayProjection {
+    pub participant: Participant,
+    pub deck_count: usize,
+    pub hand_count: usize,
+    pub board_count: usize,
+    pub removed_count: usize,
+    pub unknown_transition_count: usize,
+    pub cards: Vec<OverlayCardProjection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OverlayCardProjection {
+    pub instance_id: CardInstanceId,
+    pub card_definition_key: Option<CardKey>,
+    pub knowledge: CardKnowledge,
+    pub zone: Zone,
+    pub raw_zone: Option<String>,
+    pub original_deck_candidate: bool,
+    pub consumed_from_deck: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum NormalizeError {
     #[error("snapshot does not contain /RemoteGame/GameState")]
@@ -437,6 +469,97 @@ pub fn reconcile_observation(input: ReconciliationInput<'_>) -> Vec<MatchEvent> 
     }
 
     events
+}
+
+#[must_use]
+pub fn project_overlay(observation: &SnapshotObservation) -> OverlayProjection {
+    OverlayProjection {
+        lifecycle: observation.lifecycle,
+        turn: observation.turn,
+        total_turns: observation.total_turns,
+        player: project_participant(observation, Participant::Player),
+        opponent: project_participant(observation, Participant::Opponent),
+        warnings: observation.warnings.clone(),
+    }
+}
+
+fn project_participant(
+    observation: &SnapshotObservation,
+    participant: Participant,
+) -> ParticipantOverlayProjection {
+    let deck_count = zone_count(observation, participant, "Deck");
+    let hand_count = zone_count(observation, participant, "Hand");
+    let mut cards = observation
+        .cards
+        .iter()
+        .filter(|card| card.owner == participant)
+        .map(|card| {
+            let original_deck_candidate = card.started_in_deck_entity_id.is_some();
+            OverlayCardProjection {
+                instance_id: card_instance_id(card.entity_id),
+                card_definition_key: card.card_definition_key.clone(),
+                knowledge: if card.is_known() {
+                    CardKnowledge::KnownCard
+                } else {
+                    CardKnowledge::UnknownCard
+                },
+                zone: card.domain_zone,
+                raw_zone: card.raw_zone.clone(),
+                original_deck_candidate,
+                consumed_from_deck: original_deck_candidate && card.domain_zone != Zone::Deck,
+            }
+        })
+        .collect::<Vec<_>>();
+    cards.sort_by(|left, right| {
+        zone_sort_key(left.zone)
+            .cmp(&zone_sort_key(right.zone))
+            .then_with(|| left.instance_id.0.cmp(&right.instance_id.0))
+    });
+
+    ParticipantOverlayProjection {
+        participant,
+        deck_count,
+        hand_count,
+        board_count: cards.iter().filter(|card| card.zone == Zone::Board).count(),
+        removed_count: cards
+            .iter()
+            .filter(|card| card.zone == Zone::RemovedConfirmed)
+            .count(),
+        unknown_transition_count: cards
+            .iter()
+            .filter(|card| card.zone == Zone::UnknownTransition)
+            .count(),
+        cards,
+    }
+}
+
+fn zone_count(
+    observation: &SnapshotObservation,
+    participant: Participant,
+    label: &'static str,
+) -> usize {
+    observation
+        .players
+        .iter()
+        .find(|player| player.participant == participant)
+        .and_then(|player| player.zones.iter().find(|zone| zone.label == label))
+        .map_or(0, |zone| zone.card_entity_ids.len())
+}
+
+fn zone_sort_key(zone: Zone) -> u8 {
+    match zone {
+        Zone::Deck => 0,
+        Zone::Hand => 1,
+        Zone::Board => 2,
+        Zone::Destroyed => 3,
+        Zone::Discarded => 4,
+        Zone::RemovedConfirmed => 5,
+        Zone::Transformed => 6,
+        Zone::Merged => 7,
+        Zone::Returned => 8,
+        Zone::UnknownTransition => 9,
+        Zone::Unknown => 10,
+    }
 }
 
 fn card_instance_from_observation(card: &CardObservation) -> CardInstance {
@@ -979,5 +1102,29 @@ mod tests {
             event,
             MatchEvent::CardDestroyed { .. } | MatchEvent::CardDiscarded { .. }
         )));
+    }
+
+    #[test]
+    fn projects_overlay_counts_and_consumed_original_cards() {
+        let value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-transition-after.json"
+        ))
+        .expect("fixture parses");
+        let observation = observe_game_state(&value).expect("observes game state");
+
+        let projection = project_overlay(&observation);
+
+        assert_eq!(projection.lifecycle, MatchLifecycle::InMatch);
+        assert_eq!(projection.player.deck_count, 1);
+        assert_eq!(projection.player.hand_count, 2);
+        assert_eq!(projection.opponent.deck_count, 1);
+        assert_eq!(projection.opponent.hand_count, 0);
+        assert_eq!(projection.opponent.board_count, 1);
+        assert!(projection.opponent.cards.iter().any(|card| {
+            card.instance_id == CardInstanceId("game:31".to_string())
+                && card.card_definition_key == Some(CardKey("Daken".to_string()))
+                && card.zone == Zone::Board
+                && card.consumed_from_deck
+        }));
     }
 }

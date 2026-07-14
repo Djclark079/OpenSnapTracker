@@ -26,6 +26,12 @@ Inspect local captures without printing raw account or player identity fields:
 cargo run -p state-capture -- --inspect-captures captures --inspect-card-limit 24
 ```
 
+Replay local captures through observation, reconciliation, and overlay projection:
+
+```sh
+cargo run -p state-capture -- --replay-captures captures
+```
+
 Optional redaction uses dotted JSON paths:
 
 ```sh
@@ -39,6 +45,7 @@ The tool:
 - Writes redacted JSON snapshots and `manifest.ndjson`.
 - Records timestamp, source filename, hash, parse status, and a generic game-state fingerprint when `/RemoteGame/GameState` exists.
 - Produces a sanitized inspection report for local captures, including turn state, player zone counts, known/hidden card counts, card zone summaries, JSON.NET `$id`/`$ref` resolution, and per-scenario transition hints.
+- Produces a sanitized replay report with conservative event counts and overlay-oriented player/opponent zone counts.
 - Stops cleanly on SIGINT.
 
 Inspection findings so far:

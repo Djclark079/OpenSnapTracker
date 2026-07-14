@@ -42,6 +42,10 @@ The first reconciliation pass consumes pairs of `SnapshotObservation` values and
 
 Destroy, discard, transform, merge, transfer, and theft events remain intentionally unclaimed until targeted fixtures prove the state-file signal.
 
+## Overlay Projection
+
+`state-reader` also exposes a lightweight overlay projection for development replay. It reports player/opponent deck, hand, board, removed, and unknown-transition counts plus known/hidden card visibility and whether an observed original-deck candidate has left the deck. This is a bridge toward the final overlay state, not the finished stable 12-slot layout model.
+
 ## Desktop Shell
 
 Electron owns the local desktop shell:

@@ -587,6 +587,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "domain",
  "hex",
  "serde",
  "serde_json",

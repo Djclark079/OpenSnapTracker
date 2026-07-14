@@ -1,9 +1,14 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use domain::{CardKnowledge, MatchEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use state_reader::{ReadOptions, read_json_snapshot};
+use state_reader::{
+    OverlayProjection, ParticipantOverlayProjection, ReadOptions, ReconciliationInput,
+    SnapshotObservation, observe_game_state, project_overlay, read_json_snapshot,
+    reconcile_observation,
+};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
@@ -48,6 +53,8 @@ struct Args {
     inspect_captures: Option<PathBuf>,
     #[arg(long, default_value_t = 24)]
     inspect_card_limit: usize,
+    #[arg(long, value_name = "CAPTURE_DIR")]
+    replay_captures: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +89,12 @@ fn main() -> Result<()> {
 
     if let Some(capture_dir) = &args.inspect_captures {
         let report = inspect_captures(capture_dir, args.inspect_card_limit)?;
+        print!("{report}");
+        return Ok(());
+    }
+
+    if let Some(capture_dir) = &args.replay_captures {
+        let report = replay_captures(capture_dir)?;
         print!("{report}");
         return Ok(());
     }
@@ -279,6 +292,172 @@ fn inspect_captures(capture_dir: &Path, card_limit: usize) -> Result<String> {
     Ok(report)
 }
 
+fn replay_captures(capture_dir: &Path) -> Result<String> {
+    let mut report = String::new();
+    report.push_str("# OpenSnapTracker Capture Replay\n\n");
+    report.push_str(
+        "Sanitized replay report. Events and overlay counts are derived from captured GameState snapshots; raw records are not printed.\n\n",
+    );
+
+    let mut scenario_dirs = scenario_dirs(capture_dir)?;
+    scenario_dirs.sort();
+    if scenario_dirs.is_empty() {
+        scenario_dirs.push(capture_dir.to_path_buf());
+    }
+
+    for dir in scenario_dirs {
+        replay_scenario(&dir, &mut report)?;
+    }
+
+    Ok(report)
+}
+
+fn replay_scenario(dir: &Path, report: &mut String) -> Result<()> {
+    let name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("<capture>");
+    report.push_str("## ");
+    report.push_str(name);
+    report.push_str("\n\n");
+
+    let manifest_path = dir.join("manifest.ndjson");
+    if !manifest_path.exists() {
+        report.push_str("- No manifest.ndjson found.\n\n");
+        return Ok(());
+    }
+
+    let entries = read_manifest(&manifest_path)?;
+    let mut previous: Option<SnapshotObservation> = None;
+    let mut replayed = 0usize;
+
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.source_filename == "GameState.json")
+    {
+        let Some(filename) = &entry.output_filename else {
+            continue;
+        };
+        let path = dir.join(filename);
+        let value = read_json_file(&path)?;
+        let observation =
+            observe_game_state(&value).with_context(|| format!("observe {}", path.display()))?;
+        let events = reconcile_observation(ReconciliationInput {
+            previous: previous.as_ref(),
+            current: &observation,
+            snapshot_version: entry.game_state_fingerprint.clone(),
+        });
+        let projection = project_overlay(&observation);
+
+        replayed += 1;
+        write_replay_step(entry, &observation, &events, &projection, report);
+        previous = Some(observation);
+    }
+
+    if replayed == 0 {
+        report.push_str("- No parsed GameState snapshots to replay.\n");
+    }
+    report.push('\n');
+    Ok(())
+}
+
+fn write_replay_step(
+    entry: &ManifestEntry,
+    observation: &SnapshotObservation,
+    events: &[MatchEvent],
+    projection: &OverlayProjection,
+    report: &mut String,
+) {
+    report.push_str(&format!(
+        "### GameState {} at {}\n\n",
+        short_hash(&entry.content_hash),
+        entry.capture_timestamp
+    ));
+    report.push_str(&format!(
+        "- lifecycle={:?} turn={}/{} events={}\n",
+        observation.lifecycle,
+        fmt_opt_i64(observation.turn),
+        fmt_opt_i64(observation.total_turns),
+        events.len()
+    ));
+    report.push_str("- event counts:");
+    for (event_type, count) in event_counts(events) {
+        report.push_str(&format!(" {event_type}={count}"));
+    }
+    report.push('\n');
+
+    write_participant_projection(&projection.player, report);
+    write_participant_projection(&projection.opponent, report);
+
+    if !projection.warnings.is_empty() {
+        report.push_str("- warnings:\n");
+        for warning in &projection.warnings {
+            report.push_str("  - ");
+            report.push_str(warning);
+            report.push('\n');
+        }
+    }
+    report.push('\n');
+}
+
+fn write_participant_projection(participant: &ParticipantOverlayProjection, report: &mut String) {
+    let known = participant
+        .cards
+        .iter()
+        .filter(|card| card.knowledge == CardKnowledge::KnownCard)
+        .count();
+    let hidden = participant.cards.len().saturating_sub(known);
+    let consumed_original = participant
+        .cards
+        .iter()
+        .filter(|card| card.consumed_from_deck)
+        .count();
+
+    report.push_str(&format!(
+        "- {:?}: deck={} hand={} board={} removed={} unknown_transition={} cards={} known={} hidden={} consumed_original={}\n",
+        participant.participant,
+        participant.deck_count,
+        participant.hand_count,
+        participant.board_count,
+        participant.removed_count,
+        participant.unknown_transition_count,
+        participant.cards.len(),
+        known,
+        hidden,
+        consumed_original
+    ));
+}
+
+fn event_counts(events: &[MatchEvent]) -> BTreeMap<&'static str, usize> {
+    let mut counts = BTreeMap::new();
+    for event in events {
+        *counts.entry(event_type(event)).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn event_type(event: &MatchEvent) -> &'static str {
+    match event {
+        MatchEvent::MatchStarted { .. } => "match_started",
+        MatchEvent::MatchEnded => "match_ended",
+        MatchEvent::DeckIdentified { .. } => "deck_identified",
+        MatchEvent::CardInstanceObserved { .. } => "card_instance_observed",
+        MatchEvent::CardDrawn { .. } => "card_drawn",
+        MatchEvent::CardPlayed { .. } => "card_played",
+        MatchEvent::CardRevealed { .. } => "card_revealed",
+        MatchEvent::CardReturned { .. } => "card_returned",
+        MatchEvent::CardDestroyed { .. } => "card_destroyed",
+        MatchEvent::CardDiscarded { .. } => "card_discarded",
+        MatchEvent::CardRemoved { .. } => "card_removed",
+        MatchEvent::CardGenerated { .. } => "card_generated",
+        MatchEvent::CardTransferred { .. } => "card_transferred",
+        MatchEvent::CardTransformed { .. } => "card_transformed",
+        MatchEvent::CardMerged { .. } => "card_merged",
+        MatchEvent::SnapshotParseWarning { .. } => "snapshot_parse_warning",
+        MatchEvent::UnknownTransitionObserved { .. } => "unknown_transition_observed",
+    }
+}
+
 fn scenario_dirs(capture_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
     for entry in fs::read_dir(capture_dir)
@@ -286,7 +465,11 @@ fn scenario_dirs(capture_dir: &Path) -> Result<Vec<PathBuf>> {
     {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() && path.join("manifest.ndjson").exists() {
+        let is_helper_dir = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('_'));
+        if path.is_dir() && !is_helper_dir && path.join("manifest.ndjson").exists() {
             dirs.push(path);
         }
     }
@@ -925,5 +1108,58 @@ mod tests {
         assert!(report.contains("zone=Deck"));
         assert!(!report.contains("private name"));
         assert!(!report.contains("private account"));
+    }
+
+    #[test]
+    fn replay_report_summarizes_events_and_projection() {
+        let captures = tempdir().expect("captures tempdir");
+        let scenario = captures.path().join("001-replay");
+        fs::create_dir(&scenario).expect("scenario dir");
+
+        let first_filename = "2026-07-14T00-00-00Z_aaa_GameState.json";
+        let second_filename = "2026-07-14T00-00-01Z_bbb_GameState.json";
+        fs::write(
+            scenario.join(first_filename),
+            include_str!("../../../fixtures/snapshots/sanitized-active-turn.json"),
+        )
+        .expect("write first fixture");
+        fs::write(
+            scenario.join(second_filename),
+            include_str!("../../../fixtures/snapshots/sanitized-draw-after.json"),
+        )
+        .expect("write second fixture");
+
+        let manifest = [
+            ManifestEntry {
+                capture_timestamp: "2026-07-14T00:00:00Z".to_string(),
+                source_filename: "GameState.json".to_string(),
+                output_filename: Some(first_filename.to_string()),
+                content_hash: "aaaaaaaaaaaa".to_string(),
+                parse_status: ParseStatus::Parsed,
+                game_state_fingerprint: Some("fingerprint-a".to_string()),
+            },
+            ManifestEntry {
+                capture_timestamp: "2026-07-14T00:00:01Z".to_string(),
+                source_filename: "GameState.json".to_string(),
+                output_filename: Some(second_filename.to_string()),
+                content_hash: "bbbbbbbbbbbb".to_string(),
+                parse_status: ParseStatus::Parsed,
+                game_state_fingerprint: Some("fingerprint-b".to_string()),
+            },
+        ];
+        let manifest_text = manifest
+            .iter()
+            .map(|entry| serde_json::to_string(entry).expect("manifest entry serializes"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(scenario.join("manifest.ndjson"), manifest_text).expect("write manifest");
+
+        let report = replay_captures(captures.path()).expect("replay captures");
+
+        assert!(report.contains("card_drawn=1"));
+        assert!(report.contains("card_revealed=1"));
+        assert!(report.contains("Player: deck=0 hand=2"));
+        assert!(report.contains("Opponent: deck=1 hand=1"));
     }
 }

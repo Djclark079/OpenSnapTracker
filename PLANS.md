@@ -42,6 +42,7 @@ Progress:
 - [x] Sanitized fixtures derived from observed capture structure.
 - [x] Snapshot observation normalizer implemented against fixture-backed schema observations.
 - [x] First reconciliation pass maps observation diffs into conservative domain events.
+- [x] Capture replay command emits conservative event counts and overlay projection summaries from ignored local captures.
 - [ ] Destroy/discard/remove semantics validated with targeted fixtures.
 
 ## Milestone 3: Overlay Shell Decision

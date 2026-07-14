@@ -67,7 +67,8 @@ pub fn read_json_snapshot(
             source,
         })?;
 
-        match serde_json::from_str::<serde_json::Value>(&raw_text) {
+        let json_text = raw_text.strip_prefix('\u{feff}').unwrap_or(&raw_text);
+        match serde_json::from_str::<serde_json::Value>(json_text) {
             Ok(parsed) => {
                 let sha256 = sha256_hex(raw_text.as_bytes());
                 return Ok(RawSnapshot {
@@ -153,6 +154,28 @@ mod tests {
             err,
             SnapshotReadError::Malformed { attempts: 2, .. }
         ));
+    }
+
+    #[test]
+    fn accepts_utf8_bom_without_repairing_json() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("GameState.json");
+        fs::write(&path, "\u{feff}{\"RemoteGame\":{\"GameState\":{}}}").expect("write fixture");
+
+        let snapshot = read_json_snapshot(
+            &path,
+            ReadOptions {
+                max_attempts: 1,
+                initial_backoff: Duration::ZERO,
+            },
+        )
+        .expect("snapshot reads");
+
+        assert!(snapshot.raw_text.starts_with('\u{feff}'));
+        assert_eq!(
+            snapshot.parsed["RemoteGame"]["GameState"],
+            serde_json::json!({})
+        );
     }
 
     #[test]

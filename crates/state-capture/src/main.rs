@@ -1,10 +1,11 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use state_reader::{ReadOptions, read_json_snapshot};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -43,6 +44,10 @@ struct Args {
     redact: Vec<String>,
     #[arg(long, default_value_t = false)]
     once: bool,
+    #[arg(long, value_name = "CAPTURE_DIR")]
+    inspect_captures: Option<PathBuf>,
+    #[arg(long, default_value_t = 24)]
+    inspect_card_limit: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +79,13 @@ pub enum ParseStatus {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if let Some(capture_dir) = &args.inspect_captures {
+        let report = inspect_captures(capture_dir, args.inspect_card_limit)?;
+        print!("{report}");
+        return Ok(());
+    }
+
     let state_dir = args
         .state_dir
         .or_else(default_state_dir)
@@ -247,6 +259,530 @@ fn fingerprint(value: &serde_json::Value) -> Option<String> {
     Some(hex::encode(Sha256::digest(bytes)))
 }
 
+fn inspect_captures(capture_dir: &Path, card_limit: usize) -> Result<String> {
+    let mut report = String::new();
+    report.push_str("# OpenSnapTracker Capture Inspection\n\n");
+    report.push_str(
+        "Sanitized structural report. Raw player names, account IDs, and full JSON records are not printed.\n\n",
+    );
+
+    let mut scenario_dirs = scenario_dirs(capture_dir)?;
+    scenario_dirs.sort();
+    if scenario_dirs.is_empty() {
+        scenario_dirs.push(capture_dir.to_path_buf());
+    }
+
+    for dir in scenario_dirs {
+        inspect_scenario(&dir, card_limit, &mut report)?;
+    }
+
+    Ok(report)
+}
+
+fn scenario_dirs(capture_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    for entry in fs::read_dir(capture_dir)
+        .with_context(|| format!("read capture directory {}", capture_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() && path.join("manifest.ndjson").exists() {
+            dirs.push(path);
+        }
+    }
+    Ok(dirs)
+}
+
+fn inspect_scenario(dir: &Path, card_limit: usize, report: &mut String) -> Result<()> {
+    let name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("<capture>");
+    report.push_str("## ");
+    report.push_str(name);
+    report.push_str("\n\n");
+
+    let manifest_path = dir.join("manifest.ndjson");
+    if !manifest_path.exists() {
+        report.push_str("- No manifest.ndjson found.\n\n");
+        return Ok(());
+    }
+
+    let entries = read_manifest(&manifest_path)?;
+    let parsed = entries
+        .iter()
+        .filter(|entry| entry.parse_status == ParseStatus::Parsed)
+        .count();
+    report.push_str(&format!(
+        "- manifest entries: {} parsed: {}\n",
+        entries.len(),
+        parsed
+    ));
+
+    let mut previous: Option<SnapshotSummary> = None;
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.source_filename == "GameState.json")
+    {
+        let Some(filename) = &entry.output_filename else {
+            report.push_str(&format!(
+                "- GameState {} parse_status={:?}\n",
+                short_hash(&entry.content_hash),
+                entry.parse_status
+            ));
+            continue;
+        };
+        let path = dir.join(filename);
+        let value = read_json_file(&path)?;
+        let summary = summarize_snapshot(entry, &value);
+        write_snapshot_summary(&summary, card_limit, report);
+        if let Some(previous_summary) = &previous {
+            write_transition_summary(previous_summary, &summary, report);
+        }
+        previous = Some(summary);
+    }
+
+    report.push('\n');
+    Ok(())
+}
+
+fn read_manifest(path: &Path) -> Result<Vec<ManifestEntry>> {
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).context("parse manifest line"))
+        .collect()
+}
+
+fn read_json_file(path: &Path) -> Result<Value> {
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let json_text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    serde_json::from_str(json_text).with_context(|| format!("parse {}", path.display()))
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SnapshotSummary {
+    timestamp: String,
+    hash: String,
+    fingerprint: Option<String>,
+    application_version: Option<String>,
+    turn: Option<i64>,
+    total_turns: Option<i64>,
+    winner_present: bool,
+    client_result_present: bool,
+    battle_result_present: bool,
+    game_mode_type: Option<String>,
+    local_player: Option<i64>,
+    enemy_player: Option<i64>,
+    players: Vec<PlayerSummary>,
+    cards: Vec<CardSummary>,
+    client_cards_drawn: usize,
+    client_cards_played: usize,
+    client_stage_requests: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PlayerSummary {
+    entity_id: Option<i64>,
+    role: String,
+    zones: BTreeMap<String, ZoneSummary>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ZoneSummary {
+    cards: usize,
+    known: usize,
+    hidden: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CardSummary {
+    entity_id: i64,
+    owner_role: String,
+    def: Option<String>,
+    zone: Option<String>,
+    previous_zone: Option<String>,
+    zone_position: Option<i64>,
+    started_in_deck_entity_id: Option<i64>,
+}
+
+fn summarize_snapshot(entry: &ManifestEntry, root: &Value) -> SnapshotSummary {
+    let index = JsonNetIndex::new(root);
+    let remote = root.pointer("/RemoteGame").unwrap_or(&Value::Null);
+    let game_state = remote.pointer("/GameState").unwrap_or(&Value::Null);
+    let client_info = remote.pointer("/ClientPlayerInfo").unwrap_or(&Value::Null);
+    let local_player = remote
+        .pointer("/ClientGameInfo/LocalPlayerEntityId")
+        .and_then(Value::as_i64);
+    let enemy_player = remote
+        .pointer("/ClientGameInfo/EnemyPlayerEntityId")
+        .and_then(Value::as_i64);
+
+    let mut summary = SnapshotSummary {
+        timestamp: entry.capture_timestamp.clone(),
+        hash: entry.content_hash.clone(),
+        fingerprint: entry.game_state_fingerprint.clone(),
+        application_version: root
+            .get("ApplicationVersion")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        turn: game_state.get("Turn").and_then(Value::as_i64),
+        total_turns: game_state.get("TotalTurns").and_then(Value::as_i64),
+        winner_present: game_state.get("Winner").is_some(),
+        client_result_present: game_state.get("ClientResultMessage").is_some(),
+        battle_result_present: game_state
+            .pointer("/GameMode/Data/ClientBattleResultMessage")
+            .is_some(),
+        game_mode_type: game_state
+            .pointer("/GameMode/$type")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        local_player,
+        enemy_player,
+        players: Vec::new(),
+        cards: Vec::new(),
+        client_cards_drawn: array_len(client_info.get("CardsDrawn")),
+        client_cards_played: array_len(client_info.get("CardsPlayed")),
+        client_stage_requests: array_len(client_info.get("ClientStageRequests")),
+    };
+
+    let mut player_roles = HashMap::new();
+    if let Some(players) = game_state.get("_players").and_then(Value::as_array) {
+        for player_value in players {
+            let player = index.resolve(player_value);
+            let entity_id = player.get("EntityId").and_then(Value::as_i64);
+            let role = player_role(entity_id, local_player, enemy_player);
+            if let Some(entity_id) = entity_id {
+                player_roles.insert(entity_id, role.clone());
+            }
+
+            let mut player_summary = PlayerSummary {
+                entity_id,
+                role,
+                zones: BTreeMap::new(),
+            };
+            for zone_name in ["Deck", "Hand", "Graveyard", "Banished"] {
+                let zone = index.resolve(player.get(zone_name).unwrap_or(&Value::Null));
+                let zone_summary = summarize_zone(zone, &index);
+                player_summary
+                    .zones
+                    .insert(zone_name.to_string(), zone_summary);
+            }
+            summary.players.push(player_summary);
+        }
+    }
+
+    summary.cards = collect_cards(root, &index, &player_roles);
+    summary.cards.sort_by(|left, right| {
+        left.owner_role
+            .cmp(&right.owner_role)
+            .then_with(|| left.zone.cmp(&right.zone))
+            .then_with(|| left.zone_position.cmp(&right.zone_position))
+            .then_with(|| left.entity_id.cmp(&right.entity_id))
+    });
+
+    summary
+}
+
+fn array_len(value: Option<&Value>) -> usize {
+    value.and_then(Value::as_array).map_or(0, Vec::len)
+}
+
+fn player_role(
+    entity_id: Option<i64>,
+    local_player: Option<i64>,
+    enemy_player: Option<i64>,
+) -> String {
+    match entity_id {
+        Some(id) if Some(id) == local_player => "local".to_string(),
+        Some(id) if Some(id) == enemy_player => "enemy".to_string(),
+        Some(_) => "unknown".to_string(),
+        None => "unresolved_ref".to_string(),
+    }
+}
+
+fn summarize_zone(zone: &Value, index: &JsonNetIndex<'_>) -> ZoneSummary {
+    let mut summary = ZoneSummary::default();
+    let Some(cards) = zone.get("_cards").and_then(Value::as_array) else {
+        return summary;
+    };
+    summary.cards = cards.len();
+    for card_ref in cards {
+        let card = index.resolve(card_ref);
+        if card.get("CardDefId").and_then(Value::as_str).is_some() {
+            summary.known += 1;
+        } else {
+            summary.hidden += 1;
+        }
+    }
+    summary
+}
+
+fn collect_cards(
+    root: &Value,
+    index: &JsonNetIndex<'_>,
+    player_roles: &HashMap<i64, String>,
+) -> Vec<CardSummary> {
+    let mut cards = Vec::new();
+    collect_cards_inner(root, index, player_roles, &mut cards);
+    cards.sort_by_key(|card| card.entity_id);
+    cards.dedup_by_key(|card| card.entity_id);
+    cards
+}
+
+fn collect_cards_inner(
+    value: &Value,
+    index: &JsonNetIndex<'_>,
+    player_roles: &HashMap<i64, String>,
+    cards: &mut Vec<CardSummary>,
+) {
+    match value {
+        Value::Object(map) => {
+            if map
+                .get("$type")
+                .and_then(Value::as_str)
+                .is_some_and(|type_name| type_name.starts_with("CubeGame.Card,"))
+                && let Some(entity_id) = map.get("EntityId").and_then(Value::as_i64)
+            {
+                let owner = index.resolve(map.get("Owner").unwrap_or(&Value::Null));
+                let owner_entity = owner.get("EntityId").and_then(Value::as_i64);
+                let owner_role = owner_entity
+                    .and_then(|id| player_roles.get(&id).cloned())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let zone = index.resolve(map.get("_zone").unwrap_or(&Value::Null));
+                let previous_zone = index.resolve(map.get("_previousZone").unwrap_or(&Value::Null));
+                cards.push(CardSummary {
+                    entity_id,
+                    owner_role,
+                    def: map
+                        .get("CardDefId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    zone: zone
+                        .get("ZoneId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    previous_zone: previous_zone
+                        .get("ZoneId")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    zone_position: map.get("ZonePosition").and_then(Value::as_i64),
+                    started_in_deck_entity_id: map
+                        .get("StartedInDeckEntityId")
+                        .and_then(Value::as_i64),
+                });
+            }
+
+            for child in map.values() {
+                collect_cards_inner(child, index, player_roles, cards);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_cards_inner(child, index, player_roles, cards);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn write_snapshot_summary(summary: &SnapshotSummary, card_limit: usize, report: &mut String) {
+    report.push_str(&format!(
+        "\n### GameState {} at {}\n\n",
+        short_hash(&summary.hash),
+        summary.timestamp
+    ));
+    report.push_str(&format!(
+        "- fingerprint: {} app: {}\n",
+        summary
+            .fingerprint
+            .as_deref()
+            .map(short_hash)
+            .unwrap_or("-"),
+        summary.application_version.as_deref().unwrap_or("-")
+    ));
+    report.push_str(&format!(
+        "- turn: {} / {} winner_present: {} result: {} battle_result: {}\n",
+        fmt_opt_i64(summary.turn),
+        fmt_opt_i64(summary.total_turns),
+        summary.winner_present,
+        summary.client_result_present,
+        summary.battle_result_present
+    ));
+    report.push_str(&format!(
+        "- players: local={} enemy={} game_mode={}\n",
+        fmt_opt_i64(summary.local_player),
+        fmt_opt_i64(summary.enemy_player),
+        summary.game_mode_type.as_deref().unwrap_or("-")
+    ));
+    report.push_str(&format!(
+        "- client lists: drawn={} played={} stage_requests={}\n",
+        summary.client_cards_drawn, summary.client_cards_played, summary.client_stage_requests
+    ));
+
+    for player in &summary.players {
+        report.push_str(&format!(
+            "- player role={} entity={}:",
+            player.role,
+            fmt_opt_i64(player.entity_id)
+        ));
+        for (zone_name, zone) in &player.zones {
+            report.push_str(&format!(
+                " {zone_name}={}({} known/{} hidden)",
+                zone.cards, zone.known, zone.hidden
+            ));
+        }
+        report.push('\n');
+    }
+
+    let known = summary
+        .cards
+        .iter()
+        .filter(|card| card.def.is_some())
+        .count();
+    let hidden = summary.cards.len().saturating_sub(known);
+    let started = summary
+        .cards
+        .iter()
+        .filter(|card| card.started_in_deck_entity_id.is_some())
+        .count();
+    report.push_str(&format!(
+        "- unique cards observed: {} known={} hidden={} started_in_deck_refs={}\n",
+        summary.cards.len(),
+        known,
+        hidden,
+        started
+    ));
+
+    for card in summary.cards.iter().take(card_limit) {
+        report.push_str(&format!(
+            "  - card entity={} owner={} def={} zone={} prev={} pos={} started_deck={}\n",
+            card.entity_id,
+            card.owner_role,
+            card.def.as_deref().unwrap_or("<hidden>"),
+            card.zone.as_deref().unwrap_or("-"),
+            card.previous_zone.as_deref().unwrap_or("-"),
+            fmt_opt_i64(card.zone_position),
+            fmt_opt_i64(card.started_in_deck_entity_id)
+        ));
+    }
+    if summary.cards.len() > card_limit {
+        report.push_str(&format!(
+            "  - ... {} more cards omitted by --inspect-card-limit\n",
+            summary.cards.len() - card_limit
+        ));
+    }
+}
+
+fn write_transition_summary(
+    previous: &SnapshotSummary,
+    current: &SnapshotSummary,
+    report: &mut String,
+) {
+    let previous_cards: HashMap<i64, &CardSummary> = previous
+        .cards
+        .iter()
+        .map(|card| (card.entity_id, card))
+        .collect();
+    let mut changes = Vec::new();
+
+    for card in &current.cards {
+        if let Some(old) = previous_cards.get(&card.entity_id) {
+            if old.zone != card.zone || old.def != card.def || old.owner_role != card.owner_role {
+                changes.push(format!(
+                    "  - entity={} owner {}->{} def {}->{} zone {}->{}\n",
+                    card.entity_id,
+                    old.owner_role,
+                    card.owner_role,
+                    old.def.as_deref().unwrap_or("<hidden>"),
+                    card.def.as_deref().unwrap_or("<hidden>"),
+                    old.zone.as_deref().unwrap_or("-"),
+                    card.zone.as_deref().unwrap_or("-")
+                ));
+            }
+        } else {
+            changes.push(format!(
+                "  - entity={} appeared owner={} def={} zone={}\n",
+                card.entity_id,
+                card.owner_role,
+                card.def.as_deref().unwrap_or("<hidden>"),
+                card.zone.as_deref().unwrap_or("-")
+            ));
+        }
+    }
+
+    if changes.is_empty() {
+        report.push_str(
+            "\nTransition from previous GameState: no card identity/zone changes detected.\n",
+        );
+        return;
+    }
+
+    report.push_str("\nTransition from previous GameState:\n");
+    for change in changes.iter().take(24) {
+        report.push_str(change);
+    }
+    if changes.len() > 24 {
+        report.push_str(&format!(
+            "  - ... {} more transition rows omitted\n",
+            changes.len() - 24
+        ));
+    }
+}
+
+fn fmt_opt_i64(value: Option<i64>) -> String {
+    value.map_or_else(|| "-".to_string(), |value| value.to_string())
+}
+
+fn short_hash(hash: &str) -> &str {
+    hash.get(0..12).unwrap_or(hash)
+}
+
+#[derive(Debug)]
+struct JsonNetIndex<'a> {
+    values_by_id: HashMap<&'a str, &'a Value>,
+}
+
+impl<'a> JsonNetIndex<'a> {
+    fn new(root: &'a Value) -> Self {
+        let mut index = Self {
+            values_by_id: HashMap::new(),
+        };
+        index.collect(root);
+        index
+    }
+
+    fn resolve<'b>(&'b self, value: &'b Value) -> &'b Value
+    where
+        'a: 'b,
+    {
+        value
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|id| self.values_by_id.get(id).copied())
+            .unwrap_or(value)
+    }
+
+    fn collect(&mut self, value: &'a Value) {
+        match value {
+            Value::Object(map) => {
+                if let Some(id) = map.get("$id").and_then(Value::as_str) {
+                    self.values_by_id.insert(id, value);
+                }
+                for child in map.values() {
+                    self.collect(child);
+                }
+            }
+            Value::Array(items) => {
+                for child in items {
+                    self.collect(child);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[allow(dead_code)]
 fn available_snapshots(dir: &Path) -> Vec<PathBuf> {
     WalkDir::new(dir)
@@ -304,5 +840,90 @@ mod tests {
     fn rejects_nested_capture_file_names() {
         let err = validate_filename("../GameState.json").expect_err("nested path rejected");
         assert!(err.to_string().contains("plain file name"));
+    }
+
+    #[test]
+    fn inspect_report_resolves_json_net_references_without_private_fields() {
+        let captures = tempdir().expect("captures tempdir");
+        let scenario = captures.path().join("001-synthetic");
+        fs::create_dir(&scenario).expect("scenario dir");
+        let game_state = serde_json::json!({
+            "$id": "1",
+            "ApplicationVersion": "test",
+            "RemoteGame": {
+                "ClientGameInfo": {
+                    "LocalPlayerEntityId": 2,
+                    "EnemyPlayerEntityId": 7
+                },
+                "ClientPlayerInfo": {
+                    "Name": "private name",
+                    "AccountId": "private account",
+                    "CardsDrawn": [21],
+                    "CardsPlayed": [],
+                    "ClientStageRequests": []
+                },
+                "GameState": {
+                    "Turn": 1,
+                    "TotalTurns": 6,
+                    "GameMode": {"$type": "CubeGame.BattleGameMode, SecondDinner.CubeGame.Logic"},
+                    "_players": [
+                        {
+                            "$id": "2",
+                            "$type": "CubeGame.Player, SecondDinner.CubeGame.Logic",
+                            "EntityId": 2,
+                            "Deck": {
+                                "$id": "3",
+                                "$type": "CubeGame.Deck, SecondDinner.CubeGame.Logic",
+                                "ZoneId": "Deck",
+                                "_cards": [{"$ref": "4"}]
+                            },
+                            "Hand": {"$id": "5", "ZoneId": "Hand", "_cards": []},
+                            "Graveyard": {"$id": "6", "ZoneId": "Graveyard", "_cards": []},
+                            "Banished": {"$id": "7", "ZoneId": "Banished", "_cards": []}
+                        },
+                        {"$id": "8", "$type": "CubeGame.Player, SecondDinner.CubeGame.Logic", "EntityId": 7}
+                    ],
+                    "card": {
+                        "$id": "4",
+                        "$type": "CubeGame.Card, SecondDinner.CubeGame.Logic",
+                        "EntityId": 21,
+                        "CardDefId": "Abomination",
+                        "Owner": {"$ref": "2"},
+                        "_zone": {"$ref": "3"},
+                        "StartedInDeckEntityId": 3,
+                        "ZonePosition": 0
+                    }
+                }
+            }
+        });
+        let output_filename = "2026-07-14T00-00-00Z_abc_GameState.json";
+        fs::write(
+            scenario.join(output_filename),
+            serde_json::to_vec_pretty(&game_state).expect("serialize"),
+        )
+        .expect("write game state");
+        fs::write(
+            scenario.join("manifest.ndjson"),
+            serde_json::to_string(&ManifestEntry {
+                capture_timestamp: "2026-07-14T00:00:00Z".to_string(),
+                source_filename: "GameState.json".to_string(),
+                output_filename: Some(output_filename.to_string()),
+                content_hash: "abcdef1234567890".to_string(),
+                parse_status: ParseStatus::Parsed,
+                game_state_fingerprint: Some("fedcba654321".to_string()),
+            })
+            .expect("manifest json")
+                + "\n",
+        )
+        .expect("write manifest");
+
+        let report = inspect_captures(captures.path(), 10).expect("inspect captures");
+
+        assert!(report.contains("role=local"));
+        assert!(report.contains("Deck=1(1 known/0 hidden)"));
+        assert!(report.contains("def=Abomination"));
+        assert!(report.contains("zone=Deck"));
+        assert!(!report.contains("private name"));
+        assert!(!report.contains("private account"));
     }
 }

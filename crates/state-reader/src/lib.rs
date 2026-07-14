@@ -4,8 +4,9 @@
 //! replaced or rewritten while the game is running. It retries boundedly on
 //! transient parse failures and never repairs malformed JSON.
 
+use domain::{CardKey, MatchLifecycle, Participant, Zone};
 use sha2::{Digest, Sha256};
-use std::{fs, io, path::Path, thread, time::Duration};
+use std::{collections::HashMap, fs, io, path::Path, thread, time::Duration};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -107,6 +108,431 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotObservation {
+    pub application_version: Option<String>,
+    pub lifecycle: MatchLifecycle,
+    pub turn: Option<i64>,
+    pub total_turns: Option<i64>,
+    pub local_player_entity_id: Option<i64>,
+    pub enemy_player_entity_id: Option<i64>,
+    pub game_mode_type: Option<String>,
+    pub client_result_present: bool,
+    pub battle_result_present: bool,
+    pub client_cards_drawn_count: usize,
+    pub client_cards_played_count: usize,
+    pub client_stage_request_count: usize,
+    pub players: Vec<PlayerObservation>,
+    pub cards: Vec<CardObservation>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlayerObservation {
+    pub participant: Participant,
+    pub entity_id: Option<i64>,
+    pub zones: Vec<ZoneObservation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ZoneObservation {
+    pub label: &'static str,
+    pub raw_zone: Option<String>,
+    pub domain_zone: Zone,
+    pub card_entity_ids: Vec<i64>,
+    pub known_count: usize,
+    pub hidden_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CardObservation {
+    pub entity_id: i64,
+    pub owner: Participant,
+    pub card_definition_key: Option<CardKey>,
+    pub raw_zone: Option<String>,
+    pub domain_zone: Zone,
+    pub previous_raw_zone: Option<String>,
+    pub previous_domain_zone: Option<Zone>,
+    pub zone_position: Option<i64>,
+    pub started_in_deck_entity_id: Option<i64>,
+}
+
+impl CardObservation {
+    #[must_use]
+    pub fn is_known(&self) -> bool {
+        self.card_definition_key.is_some()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObservedTransition {
+    CardAppeared {
+        entity_id: i64,
+        owner: Participant,
+        card_definition_key: Option<CardKey>,
+        raw_zone: Option<String>,
+    },
+    CardDefinitionRevealed {
+        entity_id: i64,
+        card_definition_key: CardKey,
+    },
+    CardZoneChanged {
+        entity_id: i64,
+        from_raw_zone: Option<String>,
+        to_raw_zone: Option<String>,
+        from_domain_zone: Zone,
+        to_domain_zone: Zone,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum NormalizeError {
+    #[error("snapshot does not contain /RemoteGame/GameState")]
+    MissingGameState,
+}
+
+pub fn observe_game_state(
+    value: &serde_json::Value,
+) -> Result<SnapshotObservation, NormalizeError> {
+    let remote = value
+        .pointer("/RemoteGame")
+        .ok_or(NormalizeError::MissingGameState)?;
+    let game_state = remote
+        .pointer("/GameState")
+        .ok_or(NormalizeError::MissingGameState)?;
+    let client_info = remote
+        .pointer("/ClientPlayerInfo")
+        .unwrap_or(&serde_json::Value::Null);
+    let index = JsonNetIndex::new(value);
+
+    let local_player_entity_id = remote
+        .pointer("/ClientGameInfo/LocalPlayerEntityId")
+        .and_then(serde_json::Value::as_i64);
+    let enemy_player_entity_id = remote
+        .pointer("/ClientGameInfo/EnemyPlayerEntityId")
+        .and_then(serde_json::Value::as_i64);
+    let client_result_present = game_state.get("ClientResultMessage").is_some();
+    let battle_result_present = game_state
+        .pointer("/GameMode/Data/ClientBattleResultMessage")
+        .is_some();
+
+    let mut players = Vec::new();
+    let mut participant_by_entity_id = HashMap::new();
+    if let Some(raw_players) = game_state
+        .get("_players")
+        .and_then(serde_json::Value::as_array)
+    {
+        for raw_player in raw_players {
+            let player = index.resolve(raw_player);
+            let entity_id = player.get("EntityId").and_then(serde_json::Value::as_i64);
+            let participant =
+                participant_for_entity(entity_id, local_player_entity_id, enemy_player_entity_id);
+            if let Some(entity_id) = entity_id {
+                participant_by_entity_id.insert(entity_id, participant);
+            }
+
+            players.push(PlayerObservation {
+                participant,
+                entity_id,
+                zones: ["Deck", "Hand", "Graveyard", "Banished"]
+                    .into_iter()
+                    .map(|label| observe_zone(label, player.get(label), &index))
+                    .collect(),
+            });
+        }
+    }
+
+    let mut cards = collect_card_observations(value, &index, &participant_by_entity_id);
+    cards.sort_by_key(|card| card.entity_id);
+    cards.dedup_by_key(|card| card.entity_id);
+
+    let mut warnings = Vec::new();
+    if cards
+        .iter()
+        .any(|card| card.raw_zone.as_deref() == Some("Graveyard"))
+    {
+        warnings.push(
+            "raw Graveyard zone observed; destroyed/discarded semantics require transition context"
+                .to_string(),
+        );
+    }
+
+    Ok(SnapshotObservation {
+        application_version: value
+            .get("ApplicationVersion")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        lifecycle: infer_lifecycle(game_state, client_result_present, !players.is_empty()),
+        turn: game_state.get("Turn").and_then(serde_json::Value::as_i64),
+        total_turns: game_state
+            .get("TotalTurns")
+            .and_then(serde_json::Value::as_i64),
+        local_player_entity_id,
+        enemy_player_entity_id,
+        game_mode_type: game_state
+            .pointer("/GameMode/$type")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        client_result_present,
+        battle_result_present,
+        client_cards_drawn_count: array_len(client_info.get("CardsDrawn")),
+        client_cards_played_count: array_len(client_info.get("CardsPlayed")),
+        client_stage_request_count: array_len(client_info.get("ClientStageRequests")),
+        players,
+        cards,
+        warnings,
+    })
+}
+
+#[must_use]
+pub fn diff_observations(
+    previous: &SnapshotObservation,
+    current: &SnapshotObservation,
+) -> Vec<ObservedTransition> {
+    let previous_cards: HashMap<i64, &CardObservation> = previous
+        .cards
+        .iter()
+        .map(|card| (card.entity_id, card))
+        .collect();
+    let mut transitions = Vec::new();
+
+    for card in &current.cards {
+        let Some(previous_card) = previous_cards.get(&card.entity_id) else {
+            transitions.push(ObservedTransition::CardAppeared {
+                entity_id: card.entity_id,
+                owner: card.owner,
+                card_definition_key: card.card_definition_key.clone(),
+                raw_zone: card.raw_zone.clone(),
+            });
+            continue;
+        };
+
+        if previous_card.card_definition_key.is_none()
+            && let Some(card_definition_key) = &card.card_definition_key
+        {
+            transitions.push(ObservedTransition::CardDefinitionRevealed {
+                entity_id: card.entity_id,
+                card_definition_key: card_definition_key.clone(),
+            });
+        }
+
+        if previous_card.raw_zone != card.raw_zone {
+            transitions.push(ObservedTransition::CardZoneChanged {
+                entity_id: card.entity_id,
+                from_raw_zone: previous_card.raw_zone.clone(),
+                to_raw_zone: card.raw_zone.clone(),
+                from_domain_zone: previous_card.domain_zone,
+                to_domain_zone: card.domain_zone,
+            });
+        }
+    }
+
+    transitions
+}
+
+fn infer_lifecycle(
+    game_state: &serde_json::Value,
+    client_result_present: bool,
+    has_players: bool,
+) -> MatchLifecycle {
+    if client_result_present {
+        MatchLifecycle::MatchEnded
+    } else if game_state.get("Turn").is_some() && has_players {
+        MatchLifecycle::InMatch
+    } else {
+        MatchLifecycle::Unknown
+    }
+}
+
+fn observe_zone(
+    label: &'static str,
+    zone: Option<&serde_json::Value>,
+    index: &JsonNetIndex<'_>,
+) -> ZoneObservation {
+    let zone = index.resolve(zone.unwrap_or(&serde_json::Value::Null));
+    let raw_zone = zone
+        .get("ZoneId")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let mut card_entity_ids = Vec::new();
+    let mut known_count = 0;
+    let mut hidden_count = 0;
+
+    if let Some(cards) = zone.get("_cards").and_then(serde_json::Value::as_array) {
+        for card_ref in cards {
+            let card = index.resolve(card_ref);
+            if let Some(entity_id) = card.get("EntityId").and_then(serde_json::Value::as_i64) {
+                card_entity_ids.push(entity_id);
+                if card
+                    .get("CardDefId")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+                {
+                    known_count += 1;
+                } else {
+                    hidden_count += 1;
+                }
+            }
+        }
+    }
+
+    ZoneObservation {
+        label,
+        domain_zone: map_raw_zone(raw_zone.as_deref()),
+        raw_zone,
+        card_entity_ids,
+        known_count,
+        hidden_count,
+    }
+}
+
+fn collect_card_observations(
+    value: &serde_json::Value,
+    index: &JsonNetIndex<'_>,
+    participant_by_entity_id: &HashMap<i64, Participant>,
+) -> Vec<CardObservation> {
+    let mut cards = Vec::new();
+    collect_card_observations_inner(value, index, participant_by_entity_id, &mut cards);
+    cards
+}
+
+fn collect_card_observations_inner(
+    value: &serde_json::Value,
+    index: &JsonNetIndex<'_>,
+    participant_by_entity_id: &HashMap<i64, Participant>,
+    cards: &mut Vec<CardObservation>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map
+                .get("$type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|type_name| type_name.starts_with("CubeGame.Card,"))
+                && let Some(entity_id) = map.get("EntityId").and_then(serde_json::Value::as_i64)
+            {
+                let owner = index.resolve(map.get("Owner").unwrap_or(&serde_json::Value::Null));
+                let owner_entity_id = owner.get("EntityId").and_then(serde_json::Value::as_i64);
+                let owner = owner_entity_id
+                    .and_then(|entity_id| participant_by_entity_id.get(&entity_id).copied())
+                    .unwrap_or(Participant::Unknown);
+                let raw_zone = resolved_zone_id(map.get("_zone"), index);
+                let previous_raw_zone = resolved_zone_id(map.get("_previousZone"), index);
+
+                cards.push(CardObservation {
+                    entity_id,
+                    owner,
+                    card_definition_key: map
+                        .get("CardDefId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|key| CardKey(key.to_string())),
+                    domain_zone: map_raw_zone(raw_zone.as_deref()),
+                    raw_zone,
+                    previous_domain_zone: previous_raw_zone
+                        .as_deref()
+                        .map(|raw_zone| map_raw_zone(Some(raw_zone))),
+                    previous_raw_zone,
+                    zone_position: map.get("ZonePosition").and_then(serde_json::Value::as_i64),
+                    started_in_deck_entity_id: map
+                        .get("StartedInDeckEntityId")
+                        .and_then(serde_json::Value::as_i64),
+                });
+            }
+
+            for child in map.values() {
+                collect_card_observations_inner(child, index, participant_by_entity_id, cards);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                collect_card_observations_inner(child, index, participant_by_entity_id, cards);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolved_zone_id(value: Option<&serde_json::Value>, index: &JsonNetIndex<'_>) -> Option<String> {
+    index
+        .resolve(value.unwrap_or(&serde_json::Value::Null))
+        .get("ZoneId")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn participant_for_entity(
+    entity_id: Option<i64>,
+    local_player_entity_id: Option<i64>,
+    enemy_player_entity_id: Option<i64>,
+) -> Participant {
+    match entity_id {
+        Some(entity_id) if Some(entity_id) == local_player_entity_id => Participant::Player,
+        Some(entity_id) if Some(entity_id) == enemy_player_entity_id => Participant::Opponent,
+        _ => Participant::Unknown,
+    }
+}
+
+fn map_raw_zone(raw_zone: Option<&str>) -> Zone {
+    match raw_zone {
+        Some("Deck") => Zone::Deck,
+        Some("Hand") => Zone::Hand,
+        Some("Location") => Zone::Board,
+        Some("Banished") => Zone::RemovedConfirmed,
+        Some("Graveyard") => Zone::UnknownTransition,
+        _ => Zone::Unknown,
+    }
+}
+
+fn array_len(value: Option<&serde_json::Value>) -> usize {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len)
+}
+
+#[derive(Debug)]
+struct JsonNetIndex<'a> {
+    values_by_id: HashMap<&'a str, &'a serde_json::Value>,
+}
+
+impl<'a> JsonNetIndex<'a> {
+    fn new(root: &'a serde_json::Value) -> Self {
+        let mut index = Self {
+            values_by_id: HashMap::new(),
+        };
+        index.collect(root);
+        index
+    }
+
+    fn resolve<'b>(&'b self, value: &'b serde_json::Value) -> &'b serde_json::Value
+    where
+        'a: 'b,
+    {
+        value
+            .get("$ref")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| self.values_by_id.get(id).copied())
+            .unwrap_or(value)
+    }
+
+    fn collect(&mut self, value: &'a serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(id) = map.get("$id").and_then(serde_json::Value::as_str) {
+                    self.values_by_id.insert(id, value);
+                }
+                for child in map.values() {
+                    self.collect(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items {
+                    self.collect(child);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +631,98 @@ mod tests {
             serde_json::json!({})
         );
         assert!(snapshot.attempts > 1);
+    }
+
+    #[test]
+    fn observes_sanitized_active_turn_with_resolved_references() {
+        let value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-active-turn.json"
+        ))
+        .expect("fixture parses");
+
+        let observation = observe_game_state(&value).expect("observes game state");
+
+        assert_eq!(observation.lifecycle, MatchLifecycle::InMatch);
+        assert_eq!(observation.turn, Some(1));
+        assert_eq!(observation.local_player_entity_id, Some(2));
+        assert_eq!(observation.enemy_player_entity_id, Some(7));
+        assert_eq!(observation.client_cards_drawn_count, 1);
+        assert_eq!(observation.players.len(), 2);
+
+        let player = observation
+            .players
+            .iter()
+            .find(|player| player.participant == Participant::Player)
+            .expect("local player observed");
+        let player_hand = player
+            .zones
+            .iter()
+            .find(|zone| zone.label == "Hand")
+            .expect("hand zone");
+        assert_eq!(player_hand.card_entity_ids, vec![21]);
+        assert_eq!(player_hand.known_count, 1);
+
+        let opponent = observation
+            .players
+            .iter()
+            .find(|player| player.participant == Participant::Opponent)
+            .expect("opponent observed");
+        let opponent_deck = opponent
+            .zones
+            .iter()
+            .find(|zone| zone.label == "Deck")
+            .expect("opponent deck");
+        assert_eq!(opponent_deck.hidden_count, 1);
+
+        let abomination = observation
+            .cards
+            .iter()
+            .find(|card| card.entity_id == 21)
+            .expect("known card observed");
+        assert_eq!(
+            abomination.card_definition_key,
+            Some(CardKey("Abomination".to_string()))
+        );
+        assert_eq!(abomination.owner, Participant::Player);
+        assert_eq!(abomination.raw_zone.as_deref(), Some("Hand"));
+        assert_eq!(abomination.previous_raw_zone.as_deref(), Some("Deck"));
+        assert_eq!(abomination.domain_zone, Zone::Hand);
+    }
+
+    #[test]
+    fn diffs_sanitized_transition_without_guessing_graveyard_semantics() {
+        let before: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-active-turn.json"
+        ))
+        .expect("before fixture parses");
+        let after: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-transition-after.json"
+        ))
+        .expect("after fixture parses");
+
+        let before = observe_game_state(&before).expect("observes before");
+        let after = observe_game_state(&after).expect("observes after");
+        let transitions = diff_observations(&before, &after);
+
+        assert_eq!(after.lifecycle, MatchLifecycle::InMatch);
+        assert!(transitions.contains(&ObservedTransition::CardAppeared {
+            entity_id: 22,
+            owner: Participant::Player,
+            card_definition_key: Some(CardKey("Viv".to_string())),
+            raw_zone: Some("Hand".to_string()),
+        }));
+        assert!(
+            transitions.contains(&ObservedTransition::CardDefinitionRevealed {
+                entity_id: 31,
+                card_definition_key: CardKey("Daken".to_string()),
+            })
+        );
+        assert!(transitions.contains(&ObservedTransition::CardZoneChanged {
+            entity_id: 31,
+            from_raw_zone: Some("Hand".to_string()),
+            to_raw_zone: Some("Location".to_string()),
+            from_domain_zone: Zone::Hand,
+            to_domain_zone: Zone::Board,
+        }));
     }
 }

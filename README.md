@@ -61,6 +61,12 @@ cargo run -p state-capture -- \
   --interval-ms 1000
 ```
 
+Inspect ignored local captures:
+
+```sh
+cargo run -p state-capture -- --inspect-captures captures --inspect-card-limit 24
+```
+
 ## Known Unknowns
 
 - Exact Marvel Snap state semantics for card instances and transitions.

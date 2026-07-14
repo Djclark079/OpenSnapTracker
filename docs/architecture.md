@@ -18,6 +18,17 @@ State files
 
 The snapshot reader treats files as externally owned and possibly mid-write. It retries parse failures with bounded backoff and never repairs malformed JSON.
 
+## Snapshot Observation
+
+The first normalizer layer lives in `state-reader` and produces conservative snapshot observations:
+- resolves JSON.NET-style `$id` and `$ref` references before reading players, zones, and cards
+- identifies local player and opponent from `RemoteGame.ClientGameInfo`
+- reports raw zones alongside coarse domain zones
+- treats hidden cards as card instances with no `CardDefId`
+- diffs consecutive observations for appeared cards, card-definition reveals, and zone changes
+
+This layer intentionally does not decide whether raw `Graveyard` means destroyed or discarded. That distinction belongs in reconciliation, using transition context and fixture-backed evidence.
+
 ## Desktop Shell
 
 Electron owns the local desktop shell:

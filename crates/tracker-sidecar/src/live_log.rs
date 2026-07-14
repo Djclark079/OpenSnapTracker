@@ -25,6 +25,9 @@ pub enum LiveLogEvent {
     CardDestroyedTrigger {
         key: CardKey,
     },
+    LocationRevealed {
+        key: String,
+    },
     MatchLeft,
 }
 
@@ -32,12 +35,16 @@ pub enum LiveLogEvent {
 pub struct LiveLogState {
     player_deck_keys: HashSet<CardKey>,
     player_consumed_keys: HashSet<CardKey>,
+    player_away_keys: Vec<CardKey>,
+    player_hand_keys: Vec<CardKey>,
     player_supplemental: Vec<CardKey>,
     player_destroyed: Vec<CardKey>,
     opponent_known: Vec<CardKey>,
     opponent_consumed_keys: HashSet<CardKey>,
     staged_by_entity: HashMap<String, CardKey>,
     recently_player_resolved: HashSet<CardKey>,
+    pending_hand_swap: bool,
+    pending_hand_swap_hand_events: u8,
 }
 
 impl LiveLogState {
@@ -51,11 +58,11 @@ impl LiveLogState {
     pub fn apply(&mut self, event: LiveLogEvent) -> bool {
         match event {
             LiveLogEvent::PlayerDrew { key } => {
-                self.record_player_card_seen(key, "draw");
+                self.record_player_card_seen(key, PlayerCardSeenSource::Hand);
                 true
             }
             LiveLogEvent::PlayerHandObserved { key } => {
-                self.record_player_card_seen(key, "hand-observed");
+                self.record_player_card_seen(key, PlayerCardSeenSource::Hand);
                 true
             }
             LiveLogEvent::PlayerStaged {
@@ -66,7 +73,7 @@ impl LiveLogState {
                 if let Some(entity_id) = entity_id {
                     self.staged_by_entity.insert(entity_id, key.clone());
                 }
-                self.record_player_card_seen(key, "stage");
+                self.record_player_card_seen(key, PlayerCardSeenSource::Staged);
                 true
             }
             LiveLogEvent::PlayerStageAccepted { entity_id, undo } => {
@@ -79,7 +86,7 @@ impl LiveLogState {
                 if let Some(entity_id) = entity_id
                     && let Some(key) = self.staged_by_entity.get(&entity_id).cloned()
                 {
-                    self.record_player_card_seen(key, "stage-accepted");
+                    self.record_player_card_seen(key, PlayerCardSeenSource::Staged);
                 }
                 true
             }
@@ -95,6 +102,13 @@ impl LiveLogState {
                 if self.player_deck_keys.contains(&key) {
                     push_unique(&mut self.player_destroyed, key.clone());
                     self.player_consumed_keys.insert(key);
+                }
+                true
+            }
+            LiveLogEvent::LocationRevealed { key } => {
+                if key == "ThePeak" {
+                    self.pending_hand_swap = true;
+                    self.pending_hand_swap_hand_events = 0;
                 }
                 true
             }
@@ -114,6 +128,14 @@ impl LiveLogState {
                     .is_some_and(|key| self.player_consumed_keys.contains(key))
             {
                 card.consumed_from_deck = true;
+                if card
+                    .card_definition_key
+                    .as_ref()
+                    .is_some_and(|key| self.player_away_keys.contains(key))
+                {
+                    card.zone = Zone::UnknownTransition;
+                    card.raw_zone = Some("Player.log:away".to_string());
+                }
             }
         }
 
@@ -194,26 +216,61 @@ impl LiveLogState {
         }
     }
 
-    fn record_player_card_seen(&mut self, key: CardKey, source: &str) {
+    fn record_player_card_seen(&mut self, key: CardKey, source: PlayerCardSeenSource) {
+        if self.pending_hand_swap && source == PlayerCardSeenSource::Hand {
+            self.pending_hand_swap_hand_events =
+                self.pending_hand_swap_hand_events.saturating_add(1);
+            if !self.player_deck_keys.contains(&key) {
+                if let Some(away_key) = self.player_hand_keys.first().cloned() {
+                    push_unique(&mut self.player_away_keys, away_key.clone());
+                    self.player_consumed_keys.insert(away_key);
+                    self.player_hand_keys.remove(0);
+                }
+                self.pending_hand_swap = false;
+                self.pending_hand_swap_hand_events = 0;
+            } else if self.pending_hand_swap_hand_events >= 4 {
+                self.pending_hand_swap = false;
+                self.pending_hand_swap_hand_events = 0;
+            }
+        }
+
         if self.player_deck_keys.contains(&key) {
             self.player_consumed_keys.insert(key.clone());
         } else {
             push_unique(&mut self.player_supplemental, key.clone());
         }
-        if source == "stage" {
-            self.recently_player_resolved.insert(key);
+        match source {
+            PlayerCardSeenSource::Hand => push_unique(&mut self.player_hand_keys, key),
+            PlayerCardSeenSource::Staged => {
+                remove_first(&mut self.player_hand_keys, &key);
+                self.recently_player_resolved.insert(key);
+            }
         }
+    }
+
+    pub fn reset_match(&mut self) {
+        self.clear_match_state();
     }
 
     fn clear_match_state(&mut self) {
         self.player_consumed_keys.clear();
+        self.player_away_keys.clear();
+        self.player_hand_keys.clear();
         self.player_supplemental.clear();
         self.player_destroyed.clear();
         self.opponent_known.clear();
         self.opponent_consumed_keys.clear();
         self.staged_by_entity.clear();
         self.recently_player_resolved.clear();
+        self.pending_hand_swap = false;
+        self.pending_hand_swap_hand_events = 0;
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlayerCardSeenSource {
+    Hand,
+    Staged,
 }
 
 pub fn parse_live_log_line(line: &str) -> Option<LiveLogEvent> {
@@ -225,9 +282,14 @@ pub fn parse_live_log_line(line: &str) -> Option<LiveLogEvent> {
             key: CardKey(key.to_string()),
         });
     }
-    if line.contains("|HighlightCardPlayable") {
+    if line.contains("|HighlightCardPlayable") || line.contains("|HighlightCardUnplayable") {
         return parse_card_vfx_key(line).map(|key| LiveLogEvent::PlayerHandObserved {
             key: CardKey(key.to_string()),
+        });
+    }
+    if line.contains("|RevealLocation") {
+        return parse_location_vfx_key(line).map(|key| LiveLogEvent::LocationRevealed {
+            key: key.to_string(),
         });
     }
     if line.starts_with("StageCard|") {
@@ -283,6 +345,13 @@ fn parse_card_vfx_key(line: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
+fn parse_location_vfx_key(line: &str) -> Option<&str> {
+    let start = line.find("LocationVfxDefs/")? + "LocationVfxDefs/".len();
+    let rest = &line[start..];
+    let end = rest.find(".asset")?;
+    Some(&rest[..end])
+}
+
 fn parse_field_after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
     let start = line.find(marker)? + marker.len();
     let rest = &line[start..];
@@ -297,6 +366,15 @@ where
 {
     if !items.contains(&item) {
         items.push(item);
+    }
+}
+
+fn remove_first<T>(items: &mut Vec<T>, item: &T)
+where
+    T: Eq,
+{
+    if let Some(index) = items.iter().position(|candidate| candidate == item) {
+        items.remove(index);
     }
 }
 
@@ -328,6 +406,22 @@ mod tests {
             ),
             Some(LiveLogEvent::PlayerHandObserved {
                 key: CardKey("Sentinel".to_string())
+            })
+        );
+        assert_eq!(
+            parse_live_log_line(
+                "<color=#9AECFF><b>GameVfxManager</b></color> | LoadVfxDef|Start|CardVfxDefs/BlackPanther.asset|HighlightCardUnplayable"
+            ),
+            Some(LiveLogEvent::PlayerHandObserved {
+                key: CardKey("BlackPanther".to_string())
+            })
+        );
+        assert_eq!(
+            parse_live_log_line(
+                "<color=#9AECFF><b>GameVfxManager</b></color> | LoadVfxDef|Start|LocationVfxDefs/ThePeak.asset|RevealLocation"
+            ),
+            Some(LiveLogEvent::LocationRevealed {
+                key: "ThePeak".to_string()
             })
         );
         assert_eq!(
@@ -384,6 +478,40 @@ mod tests {
         assert_eq!(
             state.player_supplemental,
             vec![CardKey("Sentinel".to_string())]
+        );
+    }
+
+    #[test]
+    fn peak_swap_marks_prior_hand_card_away_and_tracks_incoming_supplemental() {
+        let mut state = LiveLogState::default();
+        state.set_player_deck([
+            CardKey("Nova".to_string()),
+            CardKey("Forge".to_string()),
+            CardKey("Viv".to_string()),
+        ]);
+
+        state.apply(LiveLogEvent::PlayerDrew {
+            key: CardKey("Nova".to_string()),
+        });
+        state.apply(LiveLogEvent::PlayerDrew {
+            key: CardKey("Forge".to_string()),
+        });
+        state.apply(LiveLogEvent::LocationRevealed {
+            key: "ThePeak".to_string(),
+        });
+        state.apply(LiveLogEvent::PlayerHandObserved {
+            key: CardKey("BlackPanther".to_string()),
+        });
+
+        assert_eq!(state.player_away_keys, vec![CardKey("Nova".to_string())]);
+        assert_eq!(
+            state.player_supplemental,
+            vec![CardKey("BlackPanther".to_string())]
+        );
+        assert!(
+            state
+                .player_consumed_keys
+                .contains(&CardKey("Nova".to_string()))
         );
     }
 

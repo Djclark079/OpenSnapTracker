@@ -23,8 +23,9 @@
         <button data-view="destroyed"><span>Destroyed</span><strong id="counter-destroyed">0</strong></button>
         <button data-view="discarded"><span>Discarded</span><strong id="counter-discarded">0</strong></button>
         <button data-view="removed"><span>Removed</span><strong id="counter-removed">0</strong></button>
-        <button data-view="supplemental"><span>Extra</span><strong id="counter-supplemental">0</strong></button>
       </footer>
+      <button id="extra-toggle" class="extra-toggle" title="Supplemental cards" hidden>+0</button>
+      <section id="extra-drawer" class="extra-drawer" hidden></section>
       <div id="tooltip" class="tooltip" hidden></div>
       <div class="resize-handle resize-handle-west" data-resize-edge="west" title="Resize width"></div>
       <div class="resize-handle resize-handle-east" data-resize-edge="east" title="Resize width"></div>
@@ -39,6 +40,8 @@
       const title = document.getElementById("title");
       const grid = document.getElementById("grid");
       const tooltip = document.getElementById("tooltip");
+      const extraToggle = document.getElementById("extra-toggle");
+      const extraDrawer = document.getElementById("extra-drawer");
       const debugBadge = document.getElementById("debug-badge");
       const debugLine = document.getElementById("debug-line");
       const counters = {
@@ -46,10 +49,10 @@
         hand: document.getElementById("counter-hand"),
         destroyed: document.getElementById("counter-destroyed"),
         discarded: document.getElementById("counter-discarded"),
-        removed: document.getElementById("counter-removed"),
-        supplemental: document.getElementById("counter-supplemental")
+        removed: document.getElementById("counter-removed")
       };
       let currentView = "deck";
+      let extraOpen = false;
       let panel = null;
       let tooltipTimer = 0;
       let latestBounds = null;
@@ -109,6 +112,7 @@
         button.className = "card";
         if (unknown || card?.knowledge === "unknown_card") button.classList.add("unknown");
         if (card?.consumed_from_deck) button.classList.add("consumed");
+        if (card?.raw_zone === "Player.log:away") button.classList.add("away");
         const label = document.createElement("span");
         label.className = "card-label";
         label.textContent = cardLabel(card, fallback);
@@ -131,7 +135,19 @@
         counters.destroyed.textContent = String(panel?.counters?.destroyed ?? 0);
         counters.discarded.textContent = String(panel?.counters?.discarded ?? 0);
         counters.removed.textContent = String(panel?.counters?.removed ?? 0);
-        counters.supplemental.textContent = String(panel?.counters?.supplemental ?? 0);
+      }
+
+      function renderExtraDrawer() {
+        const cards = panel?.supplemental || [];
+        extraToggle.hidden = cards.length === 0;
+        extraToggle.textContent = `+${cards.length}`;
+        extraToggle.toggleAttribute("data-active", extraOpen && cards.length > 0);
+        extraDrawer.hidden = !extraOpen || cards.length === 0;
+        extraDrawer.innerHTML = "";
+        if (extraDrawer.hidden) return;
+        for (const card of cards) {
+          extraDrawer.appendChild(makeCard(card, "?"));
+        }
       }
 
       function renderActiveFooterButton() {
@@ -150,6 +166,7 @@
         grid.innerHTML = "";
         title.textContent = viewTitle();
         renderCounters();
+        renderExtraDrawer();
         renderActiveFooterButton();
         grid.classList.toggle("zone-view", currentView !== "deck");
         globalThis.__ostForcePaint();
@@ -197,11 +214,17 @@
           render();
         });
       });
+      extraToggle.addEventListener("click", () => {
+        extraOpen = !extraOpen;
+        hideTooltip();
+        renderExtraDrawer();
+      });
       ipcRenderer.on("overlay-payload", (_event, payload) => {
         panel = payload.panel;
         latestPayloadSequence = payload.sequence || latestPayloadSequence;
         debugBadge.textContent = panel ? `${id.toUpperCase()} DATA` : id.toUpperCase();
         currentView = "deck";
+        if ((panel?.supplemental || []).length === 0) extraOpen = false;
         render();
         if (latestBounds) {
           debugLine.textContent = `${id} | ${mode} | ${latestBounds.x},${latestBounds.y} ${latestBounds.width}x${latestBounds.height} | update ${latestPayloadSequence}`;

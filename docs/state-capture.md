@@ -50,13 +50,14 @@ Run the live read-only tracker sidecar:
 cargo run -p tracker-sidecar -- --state-dir <state-dir> --output-json /tmp/opensnaptracker-live-overlay.json
 ```
 
-The sidecar reads `PlayState.json` and `CollectionState.json` for selected-deck identity, tails `Player.log` for real-time card movement, and still reads `GameState.json` as a save-point reconciliation source. It atomically writes the same text-only overlay payload used by the Electron spike.
+The sidecar reads `PlayState.json` and `CollectionState.json` for selected-deck identity, tails `Player.log` for real-time card movement, and reads `GameState.json` only to seed an initial payload when no live payload exists yet. It atomically writes the same text-only overlay payload used by the Electron spike.
 
 Current live parser status:
 
-- Clear live signals found: `DrawCard`, `StageCard`, `ResolveCardPlayed`, `ThisCardDestroyedTrigger`, stage responses, and leave-game markers.
+- Clear live signals found: `DrawCard`, `StageCard`, `ResolveCardPlayed`, `ThisCardDestroyedTrigger`, playable/unplayable hand highlights, selected location VFX, stage responses, and leave-game markers.
 - Player deck draw/play updates are driven by `Player.log` so they do not wait for `GameState.json` saves.
-- `Player.log` created-card handling is still being mapped. Rocks and location-generated cards should be captured in future targeted log fixtures before final semantics are claimed.
+- `Player.log` created-card handling now treats non-deck local hand highlight events as supplemental cards. This covers visible cases like generated or transferred cards entering the hand, but it remains a conservative heuristic until more fixtures exist.
+- The Peak hand-swap capture showed `LocationVfxDefs/ThePeak.asset` followed by a non-deck local hand highlight for the incoming card. The current parser marks the earliest tracked local hand card as `away` in that bounded context and does not classify it as Removed.
 
 Optional redaction uses dotted JSON paths:
 
@@ -78,7 +79,7 @@ The tool:
 
 Inspection findings so far:
 - Marvel Snap state uses JSON.NET-style `$id` and `$ref` object references. Normalizers must resolve references before interpreting player, zone, and card relationships.
-- `GameState.json` can contain stale completed-match data outside an active match and may update sparsely during focused gameplay. Lifecycle detection must use state fields and/or live log markers, not file existence alone.
+- `GameState.json` can contain stale completed-match data outside an active match and may update sparsely during focused gameplay. Live overlay card movement should come from `Player.log`; JSON is currently limited to initial payload seeding and deck identity.
 - Conquest captures expose both regular match result data and battle/conquest result structures.
 
 Do not commit raw captures. Redact and review first. Sanitized inspection reports are safer than raw captures, but still review them before sharing.

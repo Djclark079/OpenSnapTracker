@@ -48,9 +48,11 @@ Progress:
 - [x] Live tracker sidecar emits text-only overlay payloads from read-only `GameState.json`.
 - [x] Electron spike can spawn the live sidecar and reload overlay payload updates.
 - [x] Live sidecar enriches player deck title and 12-card list by joining `PlayState.json` selected-deck ids to `CollectionState.json` decks, with observed-card matching only as a fallback.
-- [x] Live sidecar now treats `Player.log` as the primary real-time signal for card movement, while JSON state files remain the selected-deck and save-point reconciliation source.
+- [x] Live sidecar now treats `Player.log` as the primary real-time signal for card movement, while JSON state files seed the selected deck and initial payload only.
+- [x] Supplemental cards moved out of the cramped footer and into a compact Electron drawer.
+- [x] The Peak transfer capture inspected; parser now has a bounded away-state heuristic for a non-deck incoming hand highlight after The Peak.
 - [ ] Removed/transform/merge semantics validated with targeted fixtures.
-- [ ] `Player.log` created-card patterns validated with targeted live captures.
+- [ ] `Player.log` created-card patterns validated with broader targeted live captures.
 
 ## Milestone 3: Overlay Shell Decision
 
@@ -76,4 +78,5 @@ Acceptance criteria:
 - 2026-07-14: Electron integration should start with the replay-exported text-only overlay payload: fixed 12-slot panels, known-card labels, unknown placeholders, and separate supplemental/destroyed/discarded/removed/unknown-transition buckets. Card art and metadata remain separate follow-up work.
 - 2026-07-14: First live tracker loop uses a Rust sidecar that reads `GameState.json`, skips unchanged hashes, reconciles snapshots in memory, and atomically writes the same text-only overlay payload Electron already renders. This is a dev bridge, not final packaged sidecar wiring.
 - 2026-07-14: Player full deck/title should be seeded from `PlayState.json` selected deck ids (`SerializedSelectedDeckId`, with legacy `SelectedDeckId.Value` support) joined to `CollectionState.ServerState.Decks[].Id`. Observed-card matching is fallback only when selected-deck state is unavailable. Graveyard classification can use in-snapshot `_previousZone` as transition context when polling misses the exact move frame.
-- 2026-07-14: `GameState.json` appears to save/update sparsely during focused gameplay under Proton; `Player.log` is a better live event source. The sidecar should pivot live tracking toward a structured `Player.log` parser, keeping `PlayState.json`/`CollectionState.json` for selected-deck identity and `GameState.json` for authoritative save-point reconciliation.
+- 2026-07-14: `GameState.json` appears to save/update sparsely during focused gameplay under Proton; `Player.log` is a better live event source. The sidecar now treats `Player.log` as live truth for card movement, keeps `PlayState.json`/`CollectionState.json` for selected-deck identity, and only uses `GameState.json` to seed the initial overlay payload when needed.
+- 2026-07-14: The Peak capture showed location reveal VFX followed by a non-deck local hand highlight for the incoming swapped card. The parser marks a bounded earliest-known-hand card as `away` with a magenta overlay state rather than classifying it as Removed.

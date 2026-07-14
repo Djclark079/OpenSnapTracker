@@ -168,20 +168,33 @@ impl LiveTracker {
     }
 
     fn tick(&mut self) -> Result<bool> {
-        let snapshot = read_json_snapshot(&self.state_file, ReadOptions::default())
-            .with_context(|| format!("read {}", self.state_file.display()))?;
         self.refresh_play_state()?;
         self.refresh_collection_decks()?;
         let log_changed = self.refresh_player_log()?;
-        if self.previous_hash.as_deref() == Some(snapshot.sha256.as_str()) {
-            if log_changed {
-                self.write_current_payload()?;
-                self.last_update_source = Some("player-log");
-                return Ok(true);
-            }
-            return Ok(false);
+
+        if self.current_payload.is_none() {
+            self.seed_payload_from_game_state()?;
+            self.write_current_payload()?;
+            self.last_update_source = if log_changed {
+                Some("game-state-seed+player-log")
+            } else {
+                Some("game-state-seed")
+            };
+            return Ok(true);
         }
 
+        if log_changed {
+            self.write_current_payload()?;
+            self.last_update_source = Some("player-log");
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn seed_payload_from_game_state(&mut self) -> Result<()> {
+        let snapshot = read_json_snapshot(&self.state_file, ReadOptions::default())
+            .with_context(|| format!("read {}", self.state_file.display()))?;
         let observation = observe_game_state(&snapshot.parsed)
             .with_context(|| format!("observe {}", self.state_file.display()))?;
         let events = reconcile_observation(ReconciliationInput {
@@ -193,16 +206,10 @@ impl LiveTracker {
         let mut payload = text_overlay_payload(&projection);
         self.enrich_player_deck(&mut payload);
         self.current_payload = Some(payload);
-        self.write_current_payload()?;
-        self.last_update_source = if log_changed {
-            Some("game-state+player-log")
-        } else {
-            Some("game-state")
-        };
 
         self.previous_hash = Some(snapshot.sha256);
         self.previous_observation = Some(observation);
-        Ok(true)
+        Ok(())
     }
 
     fn refresh_collection_decks(&mut self) -> Result<()> {
@@ -233,9 +240,16 @@ impl LiveTracker {
         if self.previous_play_hash.as_deref() == Some(snapshot.sha256.as_str()) {
             return Ok(());
         }
-        self.selected_deck_id = parse_selected_deck_id(&snapshot.parsed);
+        let next_deck_id = parse_selected_deck_id(&snapshot.parsed);
+        if self.selected_deck_id != next_deck_id {
+            self.live_log_state.reset_match();
+            self.current_payload = None;
+            self.previous_hash = None;
+            self.previous_observation = None;
+            self.matched_player_deck = None;
+        }
+        self.selected_deck_id = next_deck_id;
         self.previous_play_hash = Some(snapshot.sha256);
-        self.matched_player_deck = None;
         Ok(())
     }
 

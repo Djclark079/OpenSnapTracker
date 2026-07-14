@@ -32,6 +32,12 @@ Replay local captures through observation, reconciliation, and overlay projectio
 cargo run -p state-capture -- --replay-captures captures
 ```
 
+Replay all scenario folders as one timestamp-ordered timeline:
+
+```sh
+cargo run -p state-capture -- --replay-captures captures --replay-chronological
+```
+
 Optional redaction uses dotted JSON paths:
 
 ```sh

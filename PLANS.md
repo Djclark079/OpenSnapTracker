@@ -43,7 +43,8 @@ Progress:
 - [x] Snapshot observation normalizer implemented against fixture-backed schema observations.
 - [x] First reconciliation pass maps observation diffs into conservative domain events.
 - [x] Capture replay command emits conservative event counts and overlay projection summaries from ignored local captures.
-- [ ] Destroy/discard/remove semantics validated with targeted fixtures.
+- [x] Initial destroy/discard semantics validated with targeted fixtures.
+- [ ] Removed/transform/merge semantics validated with targeted fixtures.
 
 ## Milestone 3: Overlay Shell Decision
 
@@ -64,5 +65,5 @@ Acceptance criteria:
 - 2026-07-11: Electron AppImage packaging works in the current environment; Tauri release binary works but AppImage bundling currently fails inside `linuxdeploy`.
 - 2026-07-13: Electron selected for v1 desktop shell. KDE Wayland/XWayland testing showed Electron working for two transparent windows, always-on-top over Marvel Snap, passthrough, hover without focus theft, visibility toggle, edit move/resize, second-monitor movement, reset, relaunch geometry, and AppImage packaging. Tauri is rejected for v1 because it required WebKitGTK/X11 workarounds, had transparent-window repaint artifacts, needed more custom shortcut/window plumbing, and still had AppImage bundling risk.
 - 2026-07-14: Initial real Conquest captures show Marvel Snap state uses JSON.NET-style `$id`/`$ref` references. Parser normalization must resolve references before interpreting players, zones, card instances, and transitions. GameState file existence alone is not an active-match signal because stale completed-match state can remain present.
-- 2026-07-14: The first normalizer layer is an observation model, not the final event engine. It preserves raw zone names and maps `Graveyard` to `UnknownTransition` until destroy/discard semantics are proven by transition fixtures.
-- 2026-07-14: First reconciliation pass emits only conservative events from fixture-backed observations: match start, card instance observed, draw, play, reveal, generated, and unknown transition. Raw `Graveyard` movement still does not imply destroyed or discarded.
+- 2026-07-14: The first normalizer layer is an observation model, not the final event engine. It preserves raw zone names and leaves raw `Graveyard` interpretation to reconciliation.
+- 2026-07-14: First reconciliation pass emits conservative events from fixture-backed observations: match start, card instance observed, draw, play, reveal, generated, discard, destroy, and unknown transition. Only hand-to-raw-`Graveyard` is classified as discard and board-to-raw-`Graveyard` as destroy; other graveyard paths remain unknown.

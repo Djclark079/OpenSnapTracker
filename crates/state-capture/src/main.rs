@@ -55,6 +55,8 @@ struct Args {
     inspect_card_limit: usize,
     #[arg(long, value_name = "CAPTURE_DIR")]
     replay_captures: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    replay_chronological: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -94,7 +96,7 @@ fn main() -> Result<()> {
     }
 
     if let Some(capture_dir) = &args.replay_captures {
-        let report = replay_captures(capture_dir)?;
+        let report = replay_captures(capture_dir, args.replay_chronological)?;
         print!("{report}");
         return Ok(());
     }
@@ -292,12 +294,17 @@ fn inspect_captures(capture_dir: &Path, card_limit: usize) -> Result<String> {
     Ok(report)
 }
 
-fn replay_captures(capture_dir: &Path) -> Result<String> {
+fn replay_captures(capture_dir: &Path, chronological: bool) -> Result<String> {
     let mut report = String::new();
     report.push_str("# OpenSnapTracker Capture Replay\n\n");
     report.push_str(
         "Sanitized replay report. Events and overlay counts are derived from captured GameState snapshots; raw records are not printed.\n\n",
     );
+
+    if chronological {
+        replay_chronological_captures(capture_dir, &mut report)?;
+        return Ok(report);
+    }
 
     let mut scenario_dirs = scenario_dirs(capture_dir)?;
     scenario_dirs.sort();
@@ -310,6 +317,75 @@ fn replay_captures(capture_dir: &Path) -> Result<String> {
     }
 
     Ok(report)
+}
+
+#[derive(Clone, Debug)]
+struct ReplaySnapshot {
+    scenario: String,
+    entry: ManifestEntry,
+    path: PathBuf,
+}
+
+fn replay_chronological_captures(capture_dir: &Path, report: &mut String) -> Result<()> {
+    report.push_str("## Chronological Timeline\n\n");
+    let mut snapshots = Vec::new();
+    let mut scenario_dirs = scenario_dirs(capture_dir)?;
+    scenario_dirs.sort();
+    if scenario_dirs.is_empty() {
+        scenario_dirs.push(capture_dir.to_path_buf());
+    }
+
+    for dir in scenario_dirs {
+        let scenario = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<capture>")
+            .to_string();
+        let manifest_path = dir.join("manifest.ndjson");
+        if !manifest_path.exists() {
+            continue;
+        }
+        for entry in read_manifest(&manifest_path)?
+            .into_iter()
+            .filter(|entry| entry.source_filename == "GameState.json")
+        {
+            let Some(filename) = &entry.output_filename else {
+                continue;
+            };
+            snapshots.push(ReplaySnapshot {
+                scenario: scenario.clone(),
+                path: dir.join(filename),
+                entry,
+            });
+        }
+    }
+
+    snapshots.sort_by(|left, right| {
+        left.entry
+            .capture_timestamp
+            .cmp(&right.entry.capture_timestamp)
+            .then_with(|| left.entry.content_hash.cmp(&right.entry.content_hash))
+    });
+    snapshots.dedup_by(|left, right| left.entry.content_hash == right.entry.content_hash);
+
+    let mut previous: Option<SnapshotObservation> = None;
+    for snapshot in snapshots {
+        let value = read_json_file(&snapshot.path)?;
+        let observation = observe_game_state(&value)
+            .with_context(|| format!("observe {}", snapshot.path.display()))?;
+        let events = reconcile_observation(ReconciliationInput {
+            previous: previous.as_ref(),
+            current: &observation,
+            snapshot_version: snapshot.entry.game_state_fingerprint.clone(),
+        });
+        let projection = project_overlay(&observation);
+
+        report.push_str(&format!("Scenario: {}\n\n", snapshot.scenario));
+        write_replay_step(&snapshot.entry, &observation, &events, &projection, report);
+        previous = Some(observation);
+    }
+
+    Ok(())
 }
 
 fn replay_scenario(dir: &Path, report: &mut String) -> Result<()> {
@@ -1155,7 +1231,7 @@ mod tests {
             + "\n";
         fs::write(scenario.join("manifest.ndjson"), manifest_text).expect("write manifest");
 
-        let report = replay_captures(captures.path()).expect("replay captures");
+        let report = replay_captures(captures.path(), false).expect("replay captures");
 
         assert!(report.contains("card_drawn=1"));
         assert!(report.contains("card_revealed=1"));

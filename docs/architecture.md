@@ -37,10 +37,12 @@ The first reconciliation pass consumes pairs of `SnapshotObservation` values and
 - `CardDrawn` for deck-to-hand movement
 - `CardPlayed` for hand-to-board movement
 - `CardRevealed` when a previously hidden card gains a `CardDefId`
+- `CardDiscarded` for hand-to-raw-`Graveyard` movement
+- `CardDestroyed` for board-to-raw-`Graveyard` movement
 - `CardGenerated` for newly appeared card instances with no observed original-deck reference
-- `UnknownTransitionObserved` for raw movements that need more evidence, including movement into raw `Graveyard`
+- `UnknownTransitionObserved` for raw movements that still need more evidence
 
-Destroy, discard, transform, merge, transfer, and theft events remain intentionally unclaimed until targeted fixtures prove the state-file signal.
+Other raw `Graveyard` paths, transform, merge, transfer, and theft events remain intentionally unclaimed until targeted fixtures prove the state-file signal.
 
 ## Overlay Projection
 

@@ -375,8 +375,11 @@ pub fn diff_observations(
 #[must_use]
 pub fn reconcile_observation(input: ReconciliationInput<'_>) -> Vec<MatchEvent> {
     let mut events = Vec::new();
+    let previous = input.previous.filter(|previous| {
+        !should_reset_reconciliation(previous.lifecycle, input.current.lifecycle)
+    });
 
-    if input.previous.is_none() && input.current.lifecycle == MatchLifecycle::InMatch {
+    if previous.is_none() && input.current.lifecycle == MatchLifecycle::InMatch {
         events.push(MatchEvent::MatchStarted {
             snapshot_version: input.snapshot_version.clone(),
         });
@@ -388,7 +391,7 @@ pub fn reconcile_observation(input: ReconciliationInput<'_>) -> Vec<MatchEvent> 
         });
     }
 
-    match input.previous {
+    match previous {
         None => {
             for card in &input.current.cards {
                 events.push(MatchEvent::CardInstanceObserved {
@@ -443,6 +446,20 @@ pub fn reconcile_observation(input: ReconciliationInput<'_>) -> Vec<MatchEvent> 
                         (Zone::Hand, Zone::Board) => events.push(MatchEvent::CardPlayed {
                             card: card_instance_id(entity_id),
                         }),
+                        (Zone::Hand, Zone::UnknownTransition)
+                            if to_raw_zone.as_deref() == Some("Graveyard") =>
+                        {
+                            events.push(MatchEvent::CardDiscarded {
+                                card: card_instance_id(entity_id),
+                            });
+                        }
+                        (Zone::Board, Zone::UnknownTransition)
+                            if to_raw_zone.as_deref() == Some("Graveyard") =>
+                        {
+                            events.push(MatchEvent::CardDestroyed {
+                                card: card_instance_id(entity_id),
+                            });
+                        }
                         (_, Zone::UnknownTransition) => {
                             events.push(MatchEvent::UnknownTransitionObserved {
                                 card: Some(card_instance_id(entity_id)),
@@ -469,6 +486,13 @@ pub fn reconcile_observation(input: ReconciliationInput<'_>) -> Vec<MatchEvent> 
     }
 
     events
+}
+
+fn should_reset_reconciliation(previous: MatchLifecycle, current: MatchLifecycle) -> bool {
+    matches!(
+        previous,
+        MatchLifecycle::Unknown | MatchLifecycle::MatchEnded
+    ) && current == MatchLifecycle::InMatch
 }
 
 #[must_use]
@@ -1072,7 +1096,41 @@ mod tests {
     }
 
     #[test]
-    fn reconciles_graveyard_movement_as_unknown_transition() {
+    fn reconciles_hand_to_graveyard_as_discarded() {
+        let before: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-active-turn.json"
+        ))
+        .expect("before fixture parses");
+        let after: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-discard-after.json"
+        ))
+        .expect("after fixture parses");
+        let before = observe_game_state(&before).expect("observes before");
+        let after = observe_game_state(&after).expect("observes after");
+
+        let events = reconcile_observation(ReconciliationInput {
+            previous: Some(&before),
+            current: &after,
+            snapshot_version: Some("fixture-discard".to_string()),
+        });
+
+        assert!(events.contains(&MatchEvent::CardDiscarded {
+            card: CardInstanceId("game:21".to_string()),
+        }));
+        assert!(!events.contains(&MatchEvent::CardDestroyed {
+            card: CardInstanceId("game:21".to_string()),
+        }));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            MatchEvent::UnknownTransitionObserved {
+                card: Some(CardInstanceId(id)),
+                ..
+            } if id == "game:21"
+        )));
+    }
+
+    #[test]
+    fn reconciles_board_to_graveyard_as_destroyed() {
         let before: serde_json::Value = serde_json::from_str(include_str!(
             "../../../fixtures/snapshots/sanitized-transition-after.json"
         ))
@@ -1090,17 +1148,18 @@ mod tests {
             snapshot_version: Some("fixture-graveyard".to_string()),
         });
 
-        assert!(events.iter().any(|event| matches!(
-            event,
-            MatchEvent::UnknownTransitionObserved {
-                card: Some(card),
-                details
-            } if card == &CardInstanceId("game:31".to_string())
-                && details["to_raw_zone"] == "Graveyard"
-        )));
+        assert!(events.contains(&MatchEvent::CardDestroyed {
+            card: CardInstanceId("game:31".to_string()),
+        }));
+        assert!(!events.contains(&MatchEvent::CardDiscarded {
+            card: CardInstanceId("game:31".to_string()),
+        }));
         assert!(!events.iter().any(|event| matches!(
             event,
-            MatchEvent::CardDestroyed { .. } | MatchEvent::CardDiscarded { .. }
+            MatchEvent::UnknownTransitionObserved {
+                card: Some(CardInstanceId(id)),
+                ..
+            } if id == "game:31"
         )));
     }
 

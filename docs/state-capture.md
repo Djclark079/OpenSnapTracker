@@ -50,7 +50,13 @@ Run the live read-only tracker sidecar:
 cargo run -p tracker-sidecar -- --state-dir <state-dir> --output-json /tmp/opensnaptracker-live-overlay.json
 ```
 
-The sidecar reads `GameState.json`, skips unchanged file hashes, reconciles against the previous observed snapshot, and atomically writes the same text-only overlay payload used by the Electron spike.
+The sidecar reads `PlayState.json` and `CollectionState.json` for selected-deck identity, tails `Player.log` for real-time card movement, and still reads `GameState.json` as a save-point reconciliation source. It atomically writes the same text-only overlay payload used by the Electron spike.
+
+Current live parser status:
+
+- Clear live signals found: `DrawCard`, `StageCard`, `ResolveCardPlayed`, `ThisCardDestroyedTrigger`, stage responses, and leave-game markers.
+- Player deck draw/play updates are driven by `Player.log` so they do not wait for `GameState.json` saves.
+- `Player.log` created-card handling is still being mapped. Rocks and location-generated cards should be captured in future targeted log fixtures before final semantics are claimed.
 
 Optional redaction uses dotted JSON paths:
 
@@ -72,7 +78,7 @@ The tool:
 
 Inspection findings so far:
 - Marvel Snap state uses JSON.NET-style `$id` and `$ref` object references. Normalizers must resolve references before interpreting player, zone, and card relationships.
-- `GameState.json` can contain stale completed-match data outside an active match. Lifecycle detection must use state fields, not file existence alone.
+- `GameState.json` can contain stale completed-match data outside an active match and may update sparsely during focused gameplay. Lifecycle detection must use state fields and/or live log markers, not file existence alone.
 - Conquest captures expose both regular match result data and battle/conquest result structures.
 
 Do not commit raw captures. Redact and review first. Sanitized inspection reports are safer than raw captures, but still review them before sharing.

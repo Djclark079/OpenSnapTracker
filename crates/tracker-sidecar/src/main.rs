@@ -1,6 +1,9 @@
+mod live_log;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use domain::{CardInstanceId, CardKey, CardKnowledge, Zone};
+use live_log::{LiveLogState, parse_live_log_line};
 use state_reader::{
     OverlayProjector, ReadOptions, ReconciliationInput, SnapshotObservation, TextOverlayCard,
     TextOverlayPayload, TextOverlaySlot, TextOverlaySlotState, observe_game_state,
@@ -59,7 +62,7 @@ struct LiveTracker {
     previous_play_hash: Option<String>,
     previous_log_position: Option<u64>,
     selected_deck_id: Option<String>,
-    log_consumed_player_cards: HashSet<CardKey>,
+    live_log_state: LiveLogState,
     collection_decks: Vec<CollectionDeck>,
     matched_player_deck: Option<CollectionDeck>,
     previous_observation: Option<SnapshotObservation>,
@@ -154,7 +157,7 @@ impl LiveTracker {
             previous_play_hash: None,
             previous_log_position: None,
             selected_deck_id: None,
-            log_consumed_player_cards: HashSet::new(),
+            live_log_state: LiveLogState::default(),
             collection_decks: Vec::new(),
             matched_player_deck: None,
             previous_observation: None,
@@ -252,7 +255,7 @@ impl LiveTracker {
         };
         if len < position {
             self.previous_log_position = Some(len);
-            self.log_consumed_player_cards.clear();
+            self.live_log_state = LiveLogState::default();
             return Ok(false);
         }
         if len == position {
@@ -267,10 +270,8 @@ impl LiveTracker {
         let text = String::from_utf8_lossy(&bytes[start..]);
         let mut changed = false;
         for line in text.lines() {
-            if let Some(key) = parse_live_consumed_card_key(line)
-                && self.log_consumed_player_cards.insert(key)
-            {
-                changed = true;
+            if let Some(event) = parse_live_log_line(line) {
+                changed |= self.live_log_state.apply(event);
             }
         }
         self.previous_log_position = Some(len);
@@ -288,6 +289,7 @@ impl LiveTracker {
                 .find(|deck| deck.id == *selected_deck_id)
                 .cloned()
         {
+            self.live_log_state.set_player_deck(deck.cards.clone());
             self.apply_player_deck(payload, &deck);
             self.matched_player_deck = Some(deck);
             return;
@@ -303,12 +305,14 @@ impl LiveTracker {
             .is_none_or(|deck| !deck_matches(deck, &observed_keys))
             && let Some(deck) = best_matching_deck(&self.collection_decks, &observed_keys)
         {
+            self.live_log_state.set_player_deck(deck.cards.clone());
             self.matched_player_deck = Some(deck.clone());
         }
 
         let Some(deck) = &self.matched_player_deck else {
             return;
         };
+        self.live_log_state.set_player_deck(deck.cards.clone());
         self.apply_player_deck(payload, deck);
     }
 
@@ -336,7 +340,6 @@ impl LiveTracker {
                     .get(key)
                     .cloned()
                     .unwrap_or_else(|| deck_text_card(index, key));
-                let card = self.apply_log_consumed_state(card);
                 TextOverlaySlot {
                     slot_index: index as u8,
                     state: TextOverlaySlotState::Known,
@@ -346,22 +349,12 @@ impl LiveTracker {
             .collect();
     }
 
-    fn apply_log_consumed_state(&self, mut card: TextOverlayCard) -> TextOverlayCard {
-        if card
-            .card_definition_key
-            .as_ref()
-            .is_some_and(|key| self.log_consumed_player_cards.contains(key))
-        {
-            card.consumed_from_deck = true;
-        }
-        card
-    }
-
     fn write_current_payload(&mut self) -> Result<()> {
         let Some(mut payload) = self.current_payload.take() else {
             return Ok(());
         };
         self.enrich_player_deck(&mut payload);
+        self.live_log_state.apply_to_payload(&mut payload);
         write_json_atomic(&self.output_json, &serde_json::to_vec_pretty(&payload)?)?;
         self.current_payload = Some(payload);
         Ok(())
@@ -427,31 +420,6 @@ fn parse_selected_deck_id(value: &serde_json::Value) -> Option<String> {
         })
         .filter(|deck_id| !deck_id.trim().is_empty())
         .map(ToOwned::to_owned)
-}
-
-fn parse_live_consumed_card_key(line: &str) -> Option<CardKey> {
-    if line.contains("|DrawCard") || line.starts_with("StageCard|") {
-        parse_card_vfx_key(line)
-            .or_else(|| parse_field_after(line, "CardDefId="))
-            .map(|key| CardKey(key.to_string()))
-    } else {
-        None
-    }
-}
-
-fn parse_card_vfx_key(line: &str) -> Option<&str> {
-    let start = line.find("CardVfxDefs/")? + "CardVfxDefs/".len();
-    let rest = &line[start..];
-    let end = rest.find(".asset")?;
-    Some(&rest[..end])
-}
-
-fn parse_field_after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
-    let start = line.find(marker)? + marker.len();
-    let rest = &line[start..];
-    let end = rest.find('|').unwrap_or(rest.len());
-    let value = rest[..end].trim();
-    (!value.is_empty()).then_some(value)
 }
 
 fn observed_player_keys(payload: &TextOverlayPayload) -> HashSet<CardKey> {
@@ -696,22 +664,5 @@ mod tests {
             })),
             Some("legacy-id".to_string())
         );
-    }
-
-    #[test]
-    fn parses_live_log_draw_and_stage_card_markers() {
-        assert_eq!(
-            parse_live_consumed_card_key(
-                "<color=#9AECFF><b>GameVfxManager</b></color> | LoadVfxDef|Start|CardVfxDefs/Viv.asset|DrawCard"
-            ),
-            Some(CardKey("Viv".to_string()))
-        );
-        assert_eq!(
-            parse_live_consumed_card_key(
-                "StageCard|CardDefId=Knull|CardEntityId=18|ZoneEntityId=15|Turn=6"
-            ),
-            Some(CardKey("Knull".to_string()))
-        );
-        assert_eq!(parse_live_consumed_card_key("StageCard|NoCardDefId"), None);
     }
 }

@@ -33,6 +33,7 @@ type OverlayPayload = Record<string, unknown> & {
 type SidecarEvent = {
   event?: string;
   path?: string;
+  source?: string;
   changed?: boolean;
   game_hash?: string | null;
 };
@@ -417,7 +418,10 @@ function handleSidecarEventLine(line: string): void {
   }
 
   if (event.event === "payload-written") {
-    console.log("[tracker-sidecar] payload-written", event.path);
+    console.log("[tracker-sidecar] payload-written", {
+      path: event.path,
+      source: event.source ?? null
+    });
     reloadOverlayPayload(true);
     return;
   }

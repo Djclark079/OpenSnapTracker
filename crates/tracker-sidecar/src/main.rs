@@ -51,16 +51,21 @@ struct LiveTracker {
     state_file: PathBuf,
     collection_file: PathBuf,
     play_file: PathBuf,
+    player_log_file: PathBuf,
     output_json: PathBuf,
     interval: Duration,
     previous_hash: Option<String>,
     previous_collection_hash: Option<String>,
     previous_play_hash: Option<String>,
+    previous_log_position: Option<u64>,
     selected_deck_id: Option<String>,
+    log_consumed_player_cards: HashSet<CardKey>,
     collection_decks: Vec<CollectionDeck>,
     matched_player_deck: Option<CollectionDeck>,
     previous_observation: Option<SnapshotObservation>,
+    current_payload: Option<TextOverlayPayload>,
     projector: OverlayProjector,
+    last_update_source: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,6 +104,7 @@ fn main() -> Result<()> {
                     emit_stdout_event(&serde_json::json!({
                         "event": "payload-written",
                         "path": tracker.output_json.display().to_string(),
+                        "source": tracker.last_update_source,
                     }))?;
                 }
                 if args.stdout_events
@@ -140,16 +146,21 @@ impl LiveTracker {
             state_file: state_dir.join(GAME_STATE_FILENAME),
             collection_file: state_dir.join(COLLECTION_STATE_FILENAME),
             play_file: state_dir.join(PLAY_STATE_FILENAME),
+            player_log_file: player_log_path(&state_dir),
             output_json,
             interval,
             previous_hash: None,
             previous_collection_hash: None,
             previous_play_hash: None,
+            previous_log_position: None,
             selected_deck_id: None,
+            log_consumed_player_cards: HashSet::new(),
             collection_decks: Vec::new(),
             matched_player_deck: None,
             previous_observation: None,
+            current_payload: None,
             projector: OverlayProjector::new(),
+            last_update_source: None,
         }
     }
 
@@ -158,7 +169,13 @@ impl LiveTracker {
             .with_context(|| format!("read {}", self.state_file.display()))?;
         self.refresh_play_state()?;
         self.refresh_collection_decks()?;
+        let log_changed = self.refresh_player_log()?;
         if self.previous_hash.as_deref() == Some(snapshot.sha256.as_str()) {
+            if log_changed {
+                self.write_current_payload()?;
+                self.last_update_source = Some("player-log");
+                return Ok(true);
+            }
             return Ok(false);
         }
 
@@ -172,7 +189,13 @@ impl LiveTracker {
         let projection = self.projector.project(&observation, &events);
         let mut payload = text_overlay_payload(&projection);
         self.enrich_player_deck(&mut payload);
-        write_json_atomic(&self.output_json, &serde_json::to_vec_pretty(&payload)?)?;
+        self.current_payload = Some(payload);
+        self.write_current_payload()?;
+        self.last_update_source = if log_changed {
+            Some("game-state+player-log")
+        } else {
+            Some("game-state")
+        };
 
         self.previous_hash = Some(snapshot.sha256);
         self.previous_observation = Some(observation);
@@ -211,6 +234,47 @@ impl LiveTracker {
         self.previous_play_hash = Some(snapshot.sha256);
         self.matched_player_deck = None;
         Ok(())
+    }
+
+    fn refresh_player_log(&mut self) -> Result<bool> {
+        let metadata = match fs::metadata(&self.player_log_file) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("stat {}", self.player_log_file.display()));
+            }
+        };
+        let len = metadata.len();
+        let Some(position) = self.previous_log_position else {
+            self.previous_log_position = Some(len);
+            return Ok(false);
+        };
+        if len < position {
+            self.previous_log_position = Some(len);
+            self.log_consumed_player_cards.clear();
+            return Ok(false);
+        }
+        if len == position {
+            return Ok(false);
+        }
+
+        let bytes = fs::read(&self.player_log_file)
+            .with_context(|| format!("read {}", self.player_log_file.display()))?;
+        let start = usize::try_from(position)
+            .unwrap_or(bytes.len())
+            .min(bytes.len());
+        let text = String::from_utf8_lossy(&bytes[start..]);
+        let mut changed = false;
+        for line in text.lines() {
+            if let Some(key) = parse_live_consumed_card_key(line)
+                && self.log_consumed_player_cards.insert(key)
+            {
+                changed = true;
+            }
+        }
+        self.previous_log_position = Some(len);
+        Ok(changed)
     }
 
     fn enrich_player_deck(&mut self, payload: &mut TextOverlayPayload) {
@@ -272,6 +336,7 @@ impl LiveTracker {
                     .get(key)
                     .cloned()
                     .unwrap_or_else(|| deck_text_card(index, key));
+                let card = self.apply_log_consumed_state(card);
                 TextOverlaySlot {
                     slot_index: index as u8,
                     state: TextOverlaySlotState::Known,
@@ -280,11 +345,41 @@ impl LiveTracker {
             })
             .collect();
     }
+
+    fn apply_log_consumed_state(&self, mut card: TextOverlayCard) -> TextOverlayCard {
+        if card
+            .card_definition_key
+            .as_ref()
+            .is_some_and(|key| self.log_consumed_player_cards.contains(key))
+        {
+            card.consumed_from_deck = true;
+        }
+        card
+    }
+
+    fn write_current_payload(&mut self) -> Result<()> {
+        let Some(mut payload) = self.current_payload.take() else {
+            return Ok(());
+        };
+        self.enrich_player_deck(&mut payload);
+        write_json_atomic(&self.output_json, &serde_json::to_vec_pretty(&payload)?)?;
+        self.current_payload = Some(payload);
+        Ok(())
+    }
 }
 
 fn default_state_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(DEFAULT_STATE_SUFFIX))
+}
+
+fn player_log_path(state_dir: &Path) -> PathBuf {
+    state_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(|snap_root| snap_root.join("Player.log"))
+        .unwrap_or_else(|| state_dir.join("Player.log"))
 }
 
 fn write_json_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -332,6 +427,31 @@ fn parse_selected_deck_id(value: &serde_json::Value) -> Option<String> {
         })
         .filter(|deck_id| !deck_id.trim().is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn parse_live_consumed_card_key(line: &str) -> Option<CardKey> {
+    if line.contains("|DrawCard") || line.starts_with("StageCard|") {
+        parse_card_vfx_key(line)
+            .or_else(|| parse_field_after(line, "CardDefId="))
+            .map(|key| CardKey(key.to_string()))
+    } else {
+        None
+    }
+}
+
+fn parse_card_vfx_key(line: &str) -> Option<&str> {
+    let start = line.find("CardVfxDefs/")? + "CardVfxDefs/".len();
+    let rest = &line[start..];
+    let end = rest.find(".asset")?;
+    Some(&rest[..end])
+}
+
+fn parse_field_after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+    let start = line.find(marker)? + marker.len();
+    let rest = &line[start..];
+    let end = rest.find('|').unwrap_or(rest.len());
+    let value = rest[..end].trim();
+    (!value.is_empty()).then_some(value)
 }
 
 fn observed_player_keys(payload: &TextOverlayPayload) -> HashSet<CardKey> {
@@ -576,5 +696,22 @@ mod tests {
             })),
             Some("legacy-id".to_string())
         );
+    }
+
+    #[test]
+    fn parses_live_log_draw_and_stage_card_markers() {
+        assert_eq!(
+            parse_live_consumed_card_key(
+                "<color=#9AECFF><b>GameVfxManager</b></color> | LoadVfxDef|Start|CardVfxDefs/Viv.asset|DrawCard"
+            ),
+            Some(CardKey("Viv".to_string()))
+        );
+        assert_eq!(
+            parse_live_consumed_card_key(
+                "StageCard|CardDefId=Knull|CardEntityId=18|ZoneEntityId=15|Turn=6"
+            ),
+            Some(CardKey("Knull".to_string()))
+        );
+        assert_eq!(parse_live_consumed_card_key("StageCard|NoCardDefId"), None);
     }
 }

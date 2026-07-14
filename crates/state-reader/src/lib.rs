@@ -8,6 +8,7 @@ use domain::{
     CardInstance, CardInstanceId, CardKey, CardKnowledge, CardOrigin, MatchEvent, MatchLifecycle,
     Participant, Provenance, RemovalReason, Zone,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, fs, io, path::Path, thread, time::Duration};
 use thiserror::Error;
@@ -227,6 +228,68 @@ pub struct OverlayCardProjection {
     pub raw_zone: Option<String>,
     pub original_deck_candidate: bool,
     pub consumed_from_deck: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TextOverlayPayload {
+    pub schema_version: u16,
+    pub lifecycle: MatchLifecycle,
+    pub turn: Option<i64>,
+    pub total_turns: Option<i64>,
+    pub player: TextOverlayPanel,
+    pub opponent: TextOverlayPanel,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TextOverlayPanel {
+    pub participant: Participant,
+    pub title: String,
+    pub deck_slots: Vec<TextOverlaySlot>,
+    pub supplemental: Vec<TextOverlayCard>,
+    pub destroyed: Vec<TextOverlayCard>,
+    pub discarded: Vec<TextOverlayCard>,
+    pub removed: Vec<TextOverlayCard>,
+    pub unknown_transition: Vec<TextOverlayCard>,
+    pub counters: TextOverlayCounters,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TextOverlaySlot {
+    pub slot_index: u8,
+    pub state: TextOverlaySlotState,
+    pub card: Option<TextOverlayCard>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextOverlaySlotState {
+    Unknown,
+    Known,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TextOverlayCard {
+    pub instance_id: CardInstanceId,
+    pub label: String,
+    pub card_definition_key: Option<CardKey>,
+    pub knowledge: CardKnowledge,
+    pub zone: Zone,
+    pub raw_zone: Option<String>,
+    pub original_deck_candidate: bool,
+    pub consumed_from_deck: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TextOverlayCounters {
+    pub deck: usize,
+    pub hand: usize,
+    pub board: usize,
+    pub destroyed: usize,
+    pub discarded: usize,
+    pub removed: usize,
+    pub supplemental: usize,
+    pub unknown_transition: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -544,6 +607,125 @@ fn should_reset_reconciliation(previous: MatchLifecycle, current: MatchLifecycle
 #[must_use]
 pub fn project_overlay(observation: &SnapshotObservation) -> OverlayProjection {
     project_overlay_with_classifications(observation, &HashMap::new())
+}
+
+#[must_use]
+pub fn text_overlay_payload(projection: &OverlayProjection) -> TextOverlayPayload {
+    TextOverlayPayload {
+        schema_version: 1,
+        lifecycle: projection.lifecycle,
+        turn: projection.turn,
+        total_turns: projection.total_turns,
+        player: text_overlay_panel(&projection.player),
+        opponent: text_overlay_panel(&projection.opponent),
+        warnings: projection.warnings.clone(),
+    }
+}
+
+fn text_overlay_panel(projection: &ParticipantOverlayProjection) -> TextOverlayPanel {
+    let mut original_deck_cards = projection
+        .cards
+        .iter()
+        .filter(|card| card.original_deck_candidate)
+        .map(text_overlay_card)
+        .collect::<Vec<_>>();
+    original_deck_cards.sort_by(|left, right| left.instance_id.0.cmp(&right.instance_id.0));
+
+    let deck_slots = (0u8..12)
+        .map(|index| {
+            let card = original_deck_cards.get(usize::from(index)).cloned();
+            TextOverlaySlot {
+                slot_index: index,
+                state: if card.is_some() {
+                    TextOverlaySlotState::Known
+                } else {
+                    TextOverlaySlotState::Unknown
+                },
+                card,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let destroyed = cards_in_zone(projection, Zone::Destroyed);
+    let discarded = cards_in_zone(projection, Zone::Discarded);
+    let removed = cards_in_zone(projection, Zone::RemovedConfirmed);
+    let unknown_transition = cards_in_zone(projection, Zone::UnknownTransition);
+    let supplemental = projection
+        .cards
+        .iter()
+        .filter(|card| !card.original_deck_candidate)
+        .filter(|card| card.knowledge == CardKnowledge::KnownCard || is_terminal_zone(card.zone))
+        .map(text_overlay_card)
+        .collect::<Vec<_>>();
+
+    TextOverlayPanel {
+        participant: projection.participant,
+        title: match projection.participant {
+            Participant::Player => "Player Deck".to_string(),
+            Participant::Opponent => "Opponent".to_string(),
+            Participant::Unknown => "Unknown".to_string(),
+        },
+        deck_slots,
+        supplemental,
+        destroyed,
+        discarded,
+        removed,
+        unknown_transition,
+        counters: TextOverlayCounters {
+            deck: projection.deck_count,
+            hand: projection.hand_count,
+            board: projection.board_count,
+            destroyed: projection.destroyed_count,
+            discarded: projection.discarded_count,
+            removed: projection.removed_count,
+            supplemental: projection
+                .cards
+                .iter()
+                .filter(|card| !card.original_deck_candidate)
+                .filter(|card| {
+                    card.knowledge == CardKnowledge::KnownCard || is_terminal_zone(card.zone)
+                })
+                .count(),
+            unknown_transition: projection.unknown_transition_count,
+        },
+    }
+}
+
+fn cards_in_zone(projection: &ParticipantOverlayProjection, zone: Zone) -> Vec<TextOverlayCard> {
+    projection
+        .cards
+        .iter()
+        .filter(|card| card.zone == zone)
+        .map(text_overlay_card)
+        .collect()
+}
+
+fn text_overlay_card(card: &OverlayCardProjection) -> TextOverlayCard {
+    TextOverlayCard {
+        instance_id: card.instance_id.clone(),
+        label: card
+            .card_definition_key
+            .as_ref()
+            .map_or_else(|| "?".to_string(), |key| key.0.clone()),
+        card_definition_key: card.card_definition_key.clone(),
+        knowledge: card.knowledge,
+        zone: card.zone,
+        raw_zone: card.raw_zone.clone(),
+        original_deck_candidate: card.original_deck_candidate,
+        consumed_from_deck: card.consumed_from_deck,
+    }
+}
+
+fn is_terminal_zone(zone: Zone) -> bool {
+    matches!(
+        zone,
+        Zone::Destroyed
+            | Zone::Discarded
+            | Zone::RemovedConfirmed
+            | Zone::Transformed
+            | Zone::Merged
+            | Zone::UnknownTransition
+    )
 }
 
 fn project_overlay_with_classifications(
@@ -1277,6 +1459,35 @@ mod tests {
     }
 
     #[test]
+    fn text_overlay_payload_has_stable_twelve_slot_panels() {
+        let value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-transition-after.json"
+        ))
+        .expect("fixture parses");
+        let observation = observe_game_state(&value).expect("observes game state");
+        let projection = project_overlay(&observation);
+
+        let payload = text_overlay_payload(&projection);
+
+        assert_eq!(payload.schema_version, 1);
+        assert_eq!(payload.player.deck_slots.len(), 12);
+        assert_eq!(payload.opponent.deck_slots.len(), 12);
+        assert_eq!(payload.player.title, "Player Deck");
+        assert_eq!(payload.opponent.title, "Opponent");
+        assert!(payload.opponent.deck_slots.iter().any(|slot| {
+            slot.state == TextOverlaySlotState::Known
+                && slot.card.as_ref().is_some_and(|card| card.label == "Daken")
+        }));
+        assert!(
+            payload
+                .player
+                .deck_slots
+                .iter()
+                .any(|slot| { slot.state == TextOverlaySlotState::Unknown && slot.card.is_none() })
+        );
+    }
+
+    #[test]
     fn stateful_projection_buckets_destroyed_and_discarded_cards() {
         let active: serde_json::Value = serde_json::from_str(include_str!(
             "../../../fixtures/snapshots/sanitized-active-turn.json"
@@ -1320,6 +1531,12 @@ mod tests {
             card.instance_id == CardInstanceId("game:21".to_string())
                 && card.zone == Zone::Discarded
         }));
+        let discard_payload = text_overlay_payload(&discard_projection);
+        assert_eq!(discard_payload.player.counters.discarded, 1);
+        assert!(discard_payload.player.discarded.iter().any(|card| {
+            card.instance_id == CardInstanceId("game:21".to_string())
+                && card.zone == Zone::Discarded
+        }));
 
         let mut projector = OverlayProjector::new();
         let board_events = reconcile_observation(ReconciliationInput {
@@ -1338,6 +1555,12 @@ mod tests {
         assert_eq!(destroy_projection.opponent.destroyed_count, 1);
         assert_eq!(destroy_projection.opponent.discarded_count, 0);
         assert!(destroy_projection.opponent.cards.iter().any(|card| {
+            card.instance_id == CardInstanceId("game:31".to_string())
+                && card.zone == Zone::Destroyed
+        }));
+        let destroy_payload = text_overlay_payload(&destroy_projection);
+        assert_eq!(destroy_payload.opponent.counters.destroyed, 1);
+        assert!(destroy_payload.opponent.destroyed.iter().any(|card| {
             card.instance_id == CardInstanceId("game:31".to_string())
                 && card.zone == Zone::Destroyed
         }));

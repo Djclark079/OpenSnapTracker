@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use state_reader::{
     OverlayProjection, OverlayProjector, ParticipantOverlayProjection, ReadOptions,
     ReconciliationInput, SnapshotObservation, observe_game_state, read_json_snapshot,
-    reconcile_observation,
+    reconcile_observation, text_overlay_payload,
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -57,6 +57,8 @@ struct Args {
     replay_captures: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     replay_chronological: bool,
+    #[arg(long, value_name = "PATH")]
+    export_overlay_json: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -96,7 +98,11 @@ fn main() -> Result<()> {
     }
 
     if let Some(capture_dir) = &args.replay_captures {
-        let report = replay_captures(capture_dir, args.replay_chronological)?;
+        let report = replay_captures(
+            capture_dir,
+            args.replay_chronological,
+            args.export_overlay_json.as_deref(),
+        )?;
         print!("{report}");
         return Ok(());
     }
@@ -294,26 +300,48 @@ fn inspect_captures(capture_dir: &Path, card_limit: usize) -> Result<String> {
     Ok(report)
 }
 
-fn replay_captures(capture_dir: &Path, chronological: bool) -> Result<String> {
+fn replay_captures(
+    capture_dir: &Path,
+    chronological: bool,
+    export_overlay_json: Option<&Path>,
+) -> Result<String> {
     let mut report = String::new();
     report.push_str("# OpenSnapTracker Capture Replay\n\n");
     report.push_str(
         "Sanitized replay report. Events and overlay counts are derived from captured GameState snapshots; raw records are not printed.\n\n",
     );
 
-    if chronological {
-        replay_chronological_captures(capture_dir, &mut report)?;
-        return Ok(report);
-    }
+    let final_projection = if chronological {
+        replay_chronological_captures(capture_dir, &mut report)?
+    } else {
+        let mut scenario_dirs = scenario_dirs(capture_dir)?;
+        scenario_dirs.sort();
+        if scenario_dirs.is_empty() {
+            scenario_dirs.push(capture_dir.to_path_buf());
+        }
 
-    let mut scenario_dirs = scenario_dirs(capture_dir)?;
-    scenario_dirs.sort();
-    if scenario_dirs.is_empty() {
-        scenario_dirs.push(capture_dir.to_path_buf());
-    }
+        let mut final_projection = None;
+        for dir in scenario_dirs {
+            final_projection = replay_scenario(&dir, &mut report)?.or(final_projection);
+        }
+        final_projection
+    };
 
-    for dir in scenario_dirs {
-        replay_scenario(&dir, &mut report)?;
+    if let Some(path) = export_overlay_json {
+        let projection = final_projection.context("no replayed GameState snapshots to export")?;
+        let payload = text_overlay_payload(&projection);
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create overlay export directory {}", parent.display()))?;
+        }
+        let bytes = serde_json::to_vec_pretty(&payload).context("serialize overlay payload")?;
+        fs::write(path, bytes).with_context(|| format!("write {}", path.display()))?;
+        report.push_str(&format!(
+            "Exported final text overlay payload to `{}`.\n",
+            path.display()
+        ));
     }
 
     Ok(report)
@@ -326,7 +354,10 @@ struct ReplaySnapshot {
     path: PathBuf,
 }
 
-fn replay_chronological_captures(capture_dir: &Path, report: &mut String) -> Result<()> {
+fn replay_chronological_captures(
+    capture_dir: &Path,
+    report: &mut String,
+) -> Result<Option<OverlayProjection>> {
     report.push_str("## Chronological Timeline\n\n");
     let mut snapshots = Vec::new();
     let mut scenario_dirs = scenario_dirs(capture_dir)?;
@@ -370,6 +401,7 @@ fn replay_chronological_captures(capture_dir: &Path, report: &mut String) -> Res
 
     let mut previous: Option<SnapshotObservation> = None;
     let mut projector = OverlayProjector::new();
+    let mut final_projection = None;
     for snapshot in snapshots {
         let value = read_json_file(&snapshot.path)?;
         let observation = observe_game_state(&value)
@@ -383,13 +415,14 @@ fn replay_chronological_captures(capture_dir: &Path, report: &mut String) -> Res
 
         report.push_str(&format!("Scenario: {}\n\n", snapshot.scenario));
         write_replay_step(&snapshot.entry, &observation, &events, &projection, report);
+        final_projection = Some(projection);
         previous = Some(observation);
     }
 
-    Ok(())
+    Ok(final_projection)
 }
 
-fn replay_scenario(dir: &Path, report: &mut String) -> Result<()> {
+fn replay_scenario(dir: &Path, report: &mut String) -> Result<Option<OverlayProjection>> {
     let name = dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -401,13 +434,14 @@ fn replay_scenario(dir: &Path, report: &mut String) -> Result<()> {
     let manifest_path = dir.join("manifest.ndjson");
     if !manifest_path.exists() {
         report.push_str("- No manifest.ndjson found.\n\n");
-        return Ok(());
+        return Ok(None);
     }
 
     let entries = read_manifest(&manifest_path)?;
     let mut previous: Option<SnapshotObservation> = None;
     let mut projector = OverlayProjector::new();
     let mut replayed = 0usize;
+    let mut final_projection = None;
 
     for entry in entries
         .iter()
@@ -429,6 +463,7 @@ fn replay_scenario(dir: &Path, report: &mut String) -> Result<()> {
 
         replayed += 1;
         write_replay_step(entry, &observation, &events, &projection, report);
+        final_projection = Some(projection);
         previous = Some(observation);
     }
 
@@ -436,7 +471,7 @@ fn replay_scenario(dir: &Path, report: &mut String) -> Result<()> {
         report.push_str("- No parsed GameState snapshots to replay.\n");
     }
     report.push('\n');
-    Ok(())
+    Ok(final_projection)
 }
 
 fn write_replay_step(
@@ -1235,11 +1270,82 @@ mod tests {
             + "\n";
         fs::write(scenario.join("manifest.ndjson"), manifest_text).expect("write manifest");
 
-        let report = replay_captures(captures.path(), false).expect("replay captures");
+        let report = replay_captures(captures.path(), false, None).expect("replay captures");
 
         assert!(report.contains("card_drawn=1"));
         assert!(report.contains("card_revealed=1"));
         assert!(report.contains("Player: deck=0 hand=2 board=0 destroyed=0 discarded=0"));
         assert!(report.contains("Opponent: deck=1 hand=1 board=0 destroyed=0 discarded=0"));
+    }
+
+    #[test]
+    fn replay_can_export_final_text_overlay_payload() {
+        let captures = tempdir().expect("captures tempdir");
+        let scenario = captures.path().join("001-replay");
+        fs::create_dir(&scenario).expect("scenario dir");
+
+        let first_filename = "2026-07-14T00-00-00Z_aaa_GameState.json";
+        let second_filename = "2026-07-14T00-00-01Z_bbb_GameState.json";
+        fs::write(
+            scenario.join(first_filename),
+            include_str!("../../../fixtures/snapshots/sanitized-active-turn.json"),
+        )
+        .expect("write first fixture");
+        fs::write(
+            scenario.join(second_filename),
+            include_str!("../../../fixtures/snapshots/sanitized-draw-after.json"),
+        )
+        .expect("write second fixture");
+
+        let manifest = [
+            ManifestEntry {
+                capture_timestamp: "2026-07-14T00:00:00Z".to_string(),
+                source_filename: "GameState.json".to_string(),
+                output_filename: Some(first_filename.to_string()),
+                content_hash: "aaaaaaaaaaaa".to_string(),
+                parse_status: ParseStatus::Parsed,
+                game_state_fingerprint: Some("fingerprint-a".to_string()),
+            },
+            ManifestEntry {
+                capture_timestamp: "2026-07-14T00:00:01Z".to_string(),
+                source_filename: "GameState.json".to_string(),
+                output_filename: Some(second_filename.to_string()),
+                content_hash: "bbbbbbbbbbbb".to_string(),
+                parse_status: ParseStatus::Parsed,
+                game_state_fingerprint: Some("fingerprint-b".to_string()),
+            },
+        ];
+        let manifest_text = manifest
+            .iter()
+            .map(|entry| serde_json::to_string(entry).expect("manifest entry serializes"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(scenario.join("manifest.ndjson"), manifest_text).expect("write manifest");
+
+        let export_path = captures.path().join("_derived").join("overlay.json");
+        let report = replay_captures(captures.path(), true, Some(&export_path))
+            .expect("replay captures with export");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&fs::read(&export_path).expect("read exported payload"))
+                .expect("payload parses");
+
+        assert!(report.contains("Exported final text overlay payload"));
+        assert_eq!(payload["schema_version"], 1);
+        assert_eq!(
+            payload["player"]["deck_slots"]
+                .as_array()
+                .expect("player slots array")
+                .len(),
+            12
+        );
+        assert_eq!(
+            payload["opponent"]["deck_slots"]
+                .as_array()
+                .expect("opponent slots array")
+                .len(),
+            12
+        );
+        assert_eq!(payload["player"]["counters"]["hand"], 2);
     }
 }

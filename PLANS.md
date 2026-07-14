@@ -44,6 +44,7 @@ Progress:
 - [x] First reconciliation pass maps observation diffs into conservative domain events.
 - [x] Capture replay command emits conservative event counts and overlay projection summaries from ignored local captures.
 - [x] Initial destroy/discard semantics validated with targeted fixtures.
+- [x] Text-only overlay payload export added for replay-derived Electron integration.
 - [ ] Removed/transform/merge semantics validated with targeted fixtures.
 
 ## Milestone 3: Overlay Shell Decision
@@ -67,3 +68,4 @@ Acceptance criteria:
 - 2026-07-14: Initial real Conquest captures show Marvel Snap state uses JSON.NET-style `$id`/`$ref` references. Parser normalization must resolve references before interpreting players, zones, card instances, and transitions. GameState file existence alone is not an active-match signal because stale completed-match state can remain present.
 - 2026-07-14: The first normalizer layer is an observation model, not the final event engine. It preserves raw zone names and leaves raw `Graveyard` interpretation to reconciliation.
 - 2026-07-14: First reconciliation pass emits conservative events from fixture-backed observations: match start, card instance observed, draw, play, reveal, generated, discard, destroy, and unknown transition. Only hand-to-raw-`Graveyard` is classified as discard and board-to-raw-`Graveyard` as destroy; other graveyard paths remain unknown.
+- 2026-07-14: Electron integration should start with the replay-exported text-only overlay payload: fixed 12-slot panels, known-card labels, unknown placeholders, and separate supplemental/destroyed/discarded/removed/unknown-transition buckets. Card art and metadata remain separate follow-up work.

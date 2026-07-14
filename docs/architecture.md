@@ -48,6 +48,8 @@ Other raw `Graveyard` paths, transform, merge, transfer, and theft events remain
 
 `state-reader` also exposes a lightweight overlay projection for development replay. It reports player/opponent deck, hand, board, destroyed, discarded, removed, and unknown-transition counts plus known/hidden card visibility and whether an observed original-deck candidate has left the deck. A stateful projector applies reconciliation events so raw `Graveyard` cards can land in destroyed/discarded buckets when the transition is known. This is a bridge toward the final overlay state, not the finished stable 12-slot layout model.
 
+For Electron integration work, `state-reader` can convert that projection into a versioned text-only overlay payload. The payload intentionally has fixed 12-slot player and opponent panels, separate supplemental and terminal-zone collections, and no art or metadata dependency. This lets the overlay render real replay-derived card names while the metadata/art pipeline remains independent.
+
 ## Desktop Shell
 
 Electron owns the local desktop shell:

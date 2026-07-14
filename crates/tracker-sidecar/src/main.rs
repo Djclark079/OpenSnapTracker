@@ -22,6 +22,7 @@ use std::{
 const DEFAULT_STATE_SUFFIX: &str = ".steam/steam/steamapps/compatdata/1997040/pfx/drive_c/users/steamuser/AppData/LocalLow/Second Dinner/SNAP/Standalone/States/nvprod";
 const GAME_STATE_FILENAME: &str = "GameState.json";
 const COLLECTION_STATE_FILENAME: &str = "CollectionState.json";
+const PLAY_STATE_FILENAME: &str = "PlayState.json";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -44,10 +45,13 @@ struct Args {
 struct LiveTracker {
     state_file: PathBuf,
     collection_file: PathBuf,
+    play_file: PathBuf,
     output_json: PathBuf,
     interval: Duration,
     previous_hash: Option<String>,
     previous_collection_hash: Option<String>,
+    previous_play_hash: Option<String>,
+    selected_deck_id: Option<String>,
     collection_decks: Vec<CollectionDeck>,
     matched_player_deck: Option<CollectionDeck>,
     previous_observation: Option<SnapshotObservation>,
@@ -56,6 +60,7 @@ struct LiveTracker {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CollectionDeck {
+    id: String,
     name: String,
     cards: Vec<CardKey>,
 }
@@ -97,10 +102,13 @@ impl LiveTracker {
         Self {
             state_file: state_dir.join(GAME_STATE_FILENAME),
             collection_file: state_dir.join(COLLECTION_STATE_FILENAME),
+            play_file: state_dir.join(PLAY_STATE_FILENAME),
             output_json,
             interval,
             previous_hash: None,
             previous_collection_hash: None,
+            previous_play_hash: None,
+            selected_deck_id: None,
             collection_decks: Vec::new(),
             matched_player_deck: None,
             previous_observation: None,
@@ -111,11 +119,11 @@ impl LiveTracker {
     fn tick(&mut self) -> Result<bool> {
         let snapshot = read_json_snapshot(&self.state_file, ReadOptions::default())
             .with_context(|| format!("read {}", self.state_file.display()))?;
+        self.refresh_play_state()?;
+        self.refresh_collection_decks()?;
         if self.previous_hash.as_deref() == Some(snapshot.sha256.as_str()) {
-            self.refresh_collection_decks()?;
             return Ok(false);
         }
-        self.refresh_collection_decks()?;
 
         let observation = observe_game_state(&snapshot.parsed)
             .with_context(|| format!("observe {}", self.state_file.display()))?;
@@ -151,10 +159,39 @@ impl LiveTracker {
         Ok(())
     }
 
+    fn refresh_play_state(&mut self) -> Result<()> {
+        let snapshot = match read_json_snapshot(&self.play_file, ReadOptions::default()) {
+            Ok(snapshot) => snapshot,
+            Err(state_reader::SnapshotReadError::Io { .. }) => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", self.play_file.display()));
+            }
+        };
+        if self.previous_play_hash.as_deref() == Some(snapshot.sha256.as_str()) {
+            return Ok(());
+        }
+        self.selected_deck_id = parse_selected_deck_id(&snapshot.parsed);
+        self.previous_play_hash = Some(snapshot.sha256);
+        self.matched_player_deck = None;
+        Ok(())
+    }
+
     fn enrich_player_deck(&mut self, payload: &mut TextOverlayPayload) {
         if self.collection_decks.is_empty() {
             return;
         }
+        if let Some(selected_deck_id) = &self.selected_deck_id
+            && let Some(deck) = self
+                .collection_decks
+                .iter()
+                .find(|deck| deck.id == *selected_deck_id)
+                .cloned()
+        {
+            self.apply_player_deck(payload, &deck);
+            self.matched_player_deck = Some(deck);
+            return;
+        }
+
         let observed_keys = observed_player_keys(payload);
         if observed_keys.is_empty() {
             return;
@@ -171,6 +208,10 @@ impl LiveTracker {
         let Some(deck) = &self.matched_player_deck else {
             return;
         };
+        self.apply_player_deck(payload, deck);
+    }
+
+    fn apply_player_deck(&self, payload: &mut TextOverlayPayload, deck: &CollectionDeck) {
         let observed_by_key = payload
             .player
             .deck_slots
@@ -229,6 +270,7 @@ fn parse_collection_decks(value: &serde_json::Value) -> Vec<CollectionDeck> {
         .into_iter()
         .flatten()
         .filter_map(|deck| {
+            let id = deck.get("Id")?.as_str()?.to_string();
             let name = deck.get("Name")?.as_str()?.to_string();
             let cards = deck
                 .get("Cards")?
@@ -237,9 +279,22 @@ fn parse_collection_decks(value: &serde_json::Value) -> Vec<CollectionDeck> {
                 .filter_map(|card| card.get("CardDefId")?.as_str())
                 .map(|key| CardKey(key.to_string()))
                 .collect::<Vec<_>>();
-            (cards.len() >= 12).then_some(CollectionDeck { name, cards })
+            (cards.len() >= 12).then_some(CollectionDeck { id, name, cards })
         })
         .collect()
+}
+
+fn parse_selected_deck_id(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("SerializedSelectedDeckId")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .pointer("/SelectedDeckId/Value")
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter(|deck_id| !deck_id.trim().is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn observed_player_keys(payload: &TextOverlayPayload) -> HashSet<CardKey> {
@@ -345,6 +400,7 @@ mod tests {
             serde_json::json!({
                 "ServerState": {
                     "Decks": [{
+                        "Id": "fixture-discard",
                         "Name": "Fixture Discard",
                         "Cards": [
                             {"CardDefId": "Abomination"},
@@ -382,6 +438,106 @@ mod tests {
                 .filter(|slot| slot["state"] == "known")
                 .count(),
             12
+        );
+    }
+
+    #[test]
+    fn play_state_selected_deck_id_beats_observed_card_matching() {
+        let temp = tempdir().expect("tempdir");
+        let state_dir = temp.path().to_path_buf();
+        let state_file = state_dir.join(GAME_STATE_FILENAME);
+        let collection_file = state_dir.join(COLLECTION_STATE_FILENAME);
+        let play_file = state_dir.join(PLAY_STATE_FILENAME);
+        let output_json = temp.path().join("overlay.json");
+        fs::write(
+            &state_file,
+            include_str!("../../../fixtures/snapshots/sanitized-active-turn.json"),
+        )
+        .expect("write fixture");
+        fs::write(
+            &play_file,
+            serde_json::json!({
+                "SerializedSelectedDeckId": "selected-deck"
+            })
+            .to_string(),
+        )
+        .expect("write play state");
+        fs::write(
+            &collection_file,
+            serde_json::json!({
+                "ServerState": {
+                    "Decks": [
+                        {
+                            "Id": "wrong-observed-match",
+                            "Name": "Wrong Observed Match",
+                            "Cards": [
+                                {"CardDefId": "Abomination"},
+                                {"CardDefId": "Blade"},
+                                {"CardDefId": "Dracula"},
+                                {"CardDefId": "Gambit"},
+                                {"CardDefId": "MoonKnight"},
+                                {"CardDefId": "Apocalypse"},
+                                {"CardDefId": "Morbius"},
+                                {"CardDefId": "Modok"},
+                                {"CardDefId": "LadySif"},
+                                {"CardDefId": "Scorn"},
+                                {"CardDefId": "Loki"},
+                                {"CardDefId": "CorvusGlaive"}
+                            ]
+                        },
+                        {
+                            "Id": "selected-deck",
+                            "Name": "Selected From PlayState",
+                            "Cards": [
+                                {"CardDefId": "Apocalypse"},
+                                {"CardDefId": "Khonshu"},
+                                {"CardDefId": "Modok"},
+                                {"CardDefId": "Dracula"},
+                                {"CardDefId": "Gambit"},
+                                {"CardDefId": "LadySif"},
+                                {"CardDefId": "Scorn"},
+                                {"CardDefId": "Morbius"},
+                                {"CardDefId": "ColleenWing"},
+                                {"CardDefId": "MoonKnight"},
+                                {"CardDefId": "CorvusGlaive"},
+                                {"CardDefId": "Blade"}
+                            ]
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write collection");
+        let mut tracker = LiveTracker::new(state_dir, output_json.clone(), Duration::ZERO);
+
+        assert!(tracker.tick().expect("tick"));
+
+        let payload: serde_json::Value =
+            serde_json::from_slice(&fs::read(output_json).expect("read payload"))
+                .expect("payload parses");
+        assert_eq!(payload["player"]["title"], "Selected From PlayState");
+        assert_eq!(
+            payload["player"]["deck_slots"][0]["card"]["label"],
+            "Apocalypse"
+        );
+    }
+
+    #[test]
+    fn parses_current_and_legacy_selected_deck_shapes() {
+        assert_eq!(
+            parse_selected_deck_id(&serde_json::json!({
+                "SerializedSelectedDeckId": "serialized-id"
+            })),
+            Some("serialized-id".to_string())
+        );
+        assert_eq!(
+            parse_selected_deck_id(&serde_json::json!({
+                "SelectedDeckId": {
+                    "Value": "legacy-id"
+                }
+            })),
+            Some("legacy-id".to_string())
         );
     }
 }

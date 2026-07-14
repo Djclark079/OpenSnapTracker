@@ -10,13 +10,14 @@ use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
     fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const DEFAULT_STATE_SUFFIX: &str = ".steam/steam/steamapps/compatdata/1997040/pfx/drive_c/users/steamuser/AppData/LocalLow/Second Dinner/SNAP/Standalone/States/nvprod";
@@ -39,6 +40,10 @@ struct Args {
     interval_ms: u64,
     #[arg(long, default_value_t = false)]
     once: bool,
+    #[arg(long, default_value_t = false)]
+    stdout_events: bool,
+    #[arg(long, default_value_t = false)]
+    debug_polls: bool,
 }
 
 #[derive(Debug)]
@@ -84,9 +89,33 @@ fn main() -> Result<()> {
     })
     .context("install SIGINT handler")?;
 
+    let mut last_poll_event = Instant::now()
+        .checked_sub(Duration::from_secs(2))
+        .unwrap_or_else(Instant::now);
     while running.load(Ordering::SeqCst) {
-        if let Err(error) = tracker.tick() {
-            eprintln!("[tracker-sidecar] {error:#}");
+        match tracker.tick() {
+            Ok(changed) => {
+                if args.stdout_events && changed {
+                    emit_stdout_event(&serde_json::json!({
+                        "event": "payload-written",
+                        "path": tracker.output_json.display().to_string(),
+                    }))?;
+                }
+                if args.stdout_events
+                    && args.debug_polls
+                    && last_poll_event.elapsed() >= Duration::from_secs(1)
+                {
+                    emit_stdout_event(&serde_json::json!({
+                        "event": "poll",
+                        "changed": changed,
+                        "game_hash": tracker.previous_hash.as_deref(),
+                    }))?;
+                    last_poll_event = Instant::now();
+                }
+            }
+            Err(error) => {
+                eprintln!("[tracker-sidecar] {error:#}");
+            }
         }
         if args.once {
             break;
@@ -94,6 +123,14 @@ fn main() -> Result<()> {
         thread::sleep(tracker.interval);
     }
 
+    Ok(())
+}
+
+fn emit_stdout_event(value: &serde_json::Value) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    serde_json::to_writer(&mut stdout, value)?;
+    writeln!(stdout)?;
+    stdout.flush()?;
     Ok(())
 }
 

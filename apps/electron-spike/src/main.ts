@@ -30,6 +30,12 @@ type OverlayPayload = Record<string, unknown> & {
   player?: unknown;
   opponent?: unknown;
 };
+type SidecarEvent = {
+  event?: string;
+  path?: string;
+  changed?: boolean;
+  game_hash?: string | null;
+};
 
 const minWidth = 288;
 const minHeight = 560;
@@ -366,6 +372,7 @@ function startTrackerSidecar(): void {
     "cargo",
     [
       "run",
+      "--quiet",
       "-p",
       "tracker-sidecar",
       "--",
@@ -374,17 +381,56 @@ function startTrackerSidecar(): void {
       "--output-json",
       outputJson,
       "--interval-ms",
-      "250"
+      "250",
+      "--stdout-events",
+      "--debug-polls"
     ],
     {
       cwd: path.resolve(__dirname, "../../.."),
-      stdio: "inherit"
+      stdio: ["ignore", "pipe", "inherit"]
     }
   );
+  let stdoutBuffer = "";
+  sidecar.stdout?.setEncoding("utf8");
+  sidecar.stdout?.on("data", (chunk: string) => {
+    stdoutBuffer += chunk;
+    const lines = stdoutBuffer.split(/\r?\n/);
+    stdoutBuffer = lines.pop() ?? "";
+    for (const line of lines) {
+      handleSidecarEventLine(line);
+    }
+  });
   sidecar.on("exit", (code, signal) => {
     console.log("[overlay-spike] tracker sidecar exited", { code, signal });
     sidecar = null;
   });
+}
+
+function handleSidecarEventLine(line: string): void {
+  if (!line.trim()) return;
+  let event: SidecarEvent;
+  try {
+    event = JSON.parse(line) as SidecarEvent;
+  } catch {
+    console.log("[tracker-sidecar]", line);
+    return;
+  }
+
+  if (event.event === "payload-written") {
+    console.log("[tracker-sidecar] payload-written", event.path);
+    reloadOverlayPayload(true);
+    return;
+  }
+
+  if (event.event === "poll") {
+    console.log("[tracker-sidecar] poll", {
+      changed: event.changed,
+      gameHash: event.game_hash?.slice(0, 12) ?? null
+    });
+    return;
+  }
+
+  console.log("[tracker-sidecar]", event);
 }
 
 function createOverlay(id: OverlayId, geometry: Geometry): BrowserWindow {

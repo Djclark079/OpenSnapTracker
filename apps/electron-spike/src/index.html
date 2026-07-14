@@ -53,10 +53,15 @@
       let latestBounds = null;
       let activeResize = null;
       let mode = "interactive";
+      let latestPayloadSequence = 0;
 
       title.textContent = id === "player" ? "Player Deck" : "Opponent";
       debugBadge.textContent = id.toUpperCase();
       document.body.dataset.overlayId = id;
+      globalThis.__ostForcePaint = () => {
+        document.body.dataset.paintTick = String(Date.now());
+        void document.body.offsetHeight;
+      };
 
       function viewTitle() {
         if (currentView === "deck") return panel?.title || (id === "player" ? "Player Deck" : "Opponent");
@@ -144,6 +149,7 @@
         renderCounters();
         renderActiveFooterButton();
         grid.classList.toggle("zone-view", currentView !== "deck");
+        globalThis.__ostForcePaint();
 
         if (panel && currentView === "deck") {
           for (const slot of panel.deck_slots || []) {
@@ -190,9 +196,13 @@
       });
       ipcRenderer.on("overlay-payload", (_event, payload) => {
         panel = payload.panel;
+        latestPayloadSequence = payload.sequence || latestPayloadSequence;
         debugBadge.textContent = panel ? `${id.toUpperCase()} DATA` : id.toUpperCase();
         currentView = "deck";
         render();
+        if (latestBounds) {
+          debugLine.textContent = `${id} | ${mode} | ${latestBounds.x},${latestBounds.y} ${latestBounds.width}x${latestBounds.height} | update ${latestPayloadSequence}`;
+        }
       });
       ipcRenderer.on("mode", (_event, nextMode) => {
         mode = nextMode;
@@ -202,7 +212,7 @@
       ipcRenderer.on("debug-state", (_event, state) => {
         const bounds = state.bounds;
         latestBounds = bounds;
-        debugLine.textContent = `${state.id} | ${state.mode} | ${bounds.x},${bounds.y} ${bounds.width}x${bounds.height}`;
+        debugLine.textContent = `${state.id} | ${state.mode} | ${bounds.x},${bounds.y} ${bounds.width}x${bounds.height} | update ${latestPayloadSequence}`;
       });
 
       document.querySelectorAll("[data-resize-edge]").forEach((handle) => {

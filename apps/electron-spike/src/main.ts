@@ -1,6 +1,7 @@
 import { app, BrowserWindow, globalShortcut, ipcMain, screen } from "electron";
 import path from "node:path";
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 
 type OverlayId = "player" | "opponent";
@@ -44,6 +45,9 @@ const windows = new Map<OverlayId, BrowserWindow>();
 const lastBounds = new Map<OverlayId, Geometry>();
 const activeResizes = new Map<OverlayId, ActiveResize>();
 let overlayPayload: OverlayPayload | null = null;
+let overlayPayloadHash: string | null = null;
+let overlayPayloadSequence = 0;
+let overlayPayloadPollTimer: NodeJS.Timeout | null = null;
 let sidecar: ChildProcess | null = null;
 let overlayPayloadWatchPath: string | null = null;
 
@@ -51,6 +55,10 @@ if (process.platform === "linux") {
   app.disableHardwareAcceleration();
   app.commandLine.appendSwitch("ozone-platform", "x11");
   app.commandLine.appendSwitch("disable-gpu");
+  app.commandLine.appendSwitch("disable-renderer-backgrounding");
+  app.commandLine.appendSwitch("disable-background-timer-throttling");
+  app.commandLine.appendSwitch("disable-backgrounding-occluded-windows");
+  app.commandLine.appendSwitch("disable-features", "CalculateNativeWinOcclusion");
 }
 
 function geometryPath(): string {
@@ -282,19 +290,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function readOverlayPayload(): OverlayPayload | null {
+function readOverlayPayload(): { payload: OverlayPayload; hash: string } | null {
   const payloadPath = overlayPayloadWatchPath ?? overlayPayloadPath();
   if (!payloadPath) return null;
   if (!fs.existsSync(payloadPath)) return null;
 
   try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(payloadPath, "utf8"));
+    const bytes = fs.readFileSync(payloadPath);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const parsed: unknown = JSON.parse(bytes.toString("utf8"));
     if (!isRecord(parsed) || !isRecord(parsed.player) || !isRecord(parsed.opponent)) {
       console.warn("[overlay-spike] ignored overlay payload with unexpected shape", payloadPath);
       return null;
     }
-    console.log("[overlay-spike] loaded overlay payload", payloadPath);
-    return parsed as OverlayPayload;
+    return { payload: parsed as OverlayPayload, hash };
   } catch (error) {
     console.warn("[overlay-spike] could not load overlay payload", payloadPath, error);
     return null;
@@ -306,20 +315,31 @@ function payloadPanel(id: OverlayId): unknown {
 }
 
 function broadcastOverlayPayload(): void {
+  overlayPayloadSequence += 1;
   for (const [id, win] of windows) {
     if (win.isDestroyed()) continue;
     win.webContents.send("overlay-payload", {
       id,
       panel: payloadPanel(id),
-      sourcePath: overlayPayloadWatchPath ?? overlayPayloadPath() ?? null
+      sourcePath: overlayPayloadWatchPath ?? overlayPayloadPath() ?? null,
+      sequence: overlayPayloadSequence
     });
+    win.webContents
+      .executeJavaScript("globalThis.__ostForcePaint?.()", true)
+      .catch(() => undefined);
   }
 }
 
-function reloadOverlayPayload(): void {
+function reloadOverlayPayload(force = false): void {
   const next = readOverlayPayload();
   if (!next) return;
-  overlayPayload = next;
+  if (!force && next.hash === overlayPayloadHash) return;
+  overlayPayload = next.payload;
+  overlayPayloadHash = next.hash;
+  console.log("[overlay-spike] loaded overlay payload", {
+    path: overlayPayloadWatchPath ?? overlayPayloadPath() ?? null,
+    sequence: overlayPayloadSequence + 1
+  });
   broadcastOverlayPayload();
 }
 
@@ -327,12 +347,13 @@ function startOverlayPayloadWatcher(): void {
   const payloadPath = overlayPayloadWatchPath ?? overlayPayloadPath();
   if (!payloadPath) return;
   overlayPayloadWatchPath = payloadPath;
-  overlayPayload = readOverlayPayload();
+  reloadOverlayPayload(true);
   fs.watchFile(payloadPath, { interval: 250 }, (current, previous) => {
     if (current.mtimeMs !== previous.mtimeMs || current.size !== previous.size) {
       reloadOverlayPayload();
     }
   });
+  overlayPayloadPollTimer = setInterval(() => reloadOverlayPayload(), 250);
 }
 
 function startTrackerSidecar(): void {
@@ -401,7 +422,8 @@ function createOverlay(id: OverlayId, geometry: Geometry): BrowserWindow {
     win.webContents.send("overlay-payload", {
       id,
       panel: payloadPanel(id),
-      sourcePath: overlayPayloadPath() ?? null
+      sourcePath: overlayPayloadPath() ?? null,
+      sequence: overlayPayloadSequence
     });
   });
   win.on("moved", () => {
@@ -464,6 +486,9 @@ app.whenReady().then(() => {
 app.on("will-quit", () => {
   if (overlayPayloadWatchPath) {
     fs.unwatchFile(overlayPayloadWatchPath);
+  }
+  if (overlayPayloadPollTimer) {
+    clearInterval(overlayPayloadPollTimer);
   }
   if (sidecar && !sidecar.killed) {
     sidecar.kill();

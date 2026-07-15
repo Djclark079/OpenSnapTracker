@@ -5,12 +5,30 @@ body {
   font-family: system-ui, sans-serif;
   color: #f7f4ff;
   user-select: none;
+  overflow: hidden;
+}
+
+:root {
+  --extra-height: 0px;
+  --card-gap: 6px;
+  --panel-x-padding: 10px;
+  --main-card-width: calc((100vw - (2 * var(--panel-x-padding)) - (2 * var(--card-gap))) / 3);
+  --extra-gap: 5px;
+  --extra-x-padding: 7px;
+  --extra-y-padding: 8px;
+  --scrollbar-gutter-width: 8px;
+  --extra-card-width: var(--main-card-width);
+  --extra-card-height: calc(var(--extra-card-width) * 7 / 5);
+}
+
+[hidden] {
+  display: none !important;
 }
 
 .overlay {
   position: relative;
   box-sizing: border-box;
-  height: 100vh;
+  height: calc(100vh - var(--extra-height));
   width: 100vw;
   border: 1px solid rgba(160, 128, 255, 0.55);
   background: rgba(10, 9, 22, 0.78);
@@ -76,11 +94,11 @@ strong {
 }
 
 .grid {
-  padding: 8px 10px;
+  padding: 8px var(--panel-x-padding);
   display: grid;
   grid-template-columns: repeat(3, minmax(44px, 1fr));
   grid-template-rows: repeat(4, minmax(82px, 1fr));
-  gap: 6px;
+  gap: var(--card-gap);
   min-height: 0;
   overflow: hidden;
 }
@@ -177,43 +195,71 @@ footer button strong {
   line-height: 1;
 }
 
+.extra-panel {
+  box-sizing: border-box;
+  width: 100vw;
+  border-right: 1px solid rgba(160, 128, 255, 0.55);
+  border-bottom: 1px solid rgba(160, 128, 255, 0.55);
+  border-left: 1px solid rgba(160, 128, 255, 0.55);
+  background: rgba(10, 9, 22, 0.9);
+}
+
 .extra-toggle {
-  position: absolute;
-  right: 8px;
-  bottom: 50px;
-  z-index: 8;
-  min-width: 34px;
-  border: 1px solid rgba(255, 70, 235, 0.55);
-  background: rgba(42, 20, 56, 0.92);
+  display: block;
+  width: 100%;
+  min-height: 27px;
+  padding: 0;
+  border-radius: 0;
+  border-top: 1px solid rgba(255, 70, 235, 0.55);
+  background: rgba(42, 20, 56, 0.78);
   color: #ffd8fb;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 800;
+  letter-spacing: 0;
 }
 
 .extra-toggle[data-active] {
-  background: rgba(255, 70, 235, 0.26);
-  box-shadow: 0 0 10px rgba(255, 70, 235, 0.35);
+  background: rgba(255, 70, 235, 0.18);
 }
 
 .extra-drawer {
-  position: absolute;
-  right: 0;
-  bottom: 44px;
-  left: 0;
-  z-index: 7;
   display: grid;
-  grid-template-columns: repeat(3, minmax(44px, 1fr));
-  grid-auto-rows: minmax(82px, 1fr);
-  gap: 6px;
-  max-height: min(45vh, 240px);
-  padding: 8px 10px;
+  grid-template-columns: repeat(3, minmax(44px, var(--extra-card-width)));
+  grid-auto-rows: auto;
+  gap: var(--extra-gap);
+  max-height: calc((2 * var(--extra-card-height)) + var(--extra-gap) + (2 * var(--extra-y-padding)));
+  padding: var(--extra-y-padding) 0 var(--extra-y-padding) var(--extra-x-padding);
   overflow-y: auto;
-  border-top: 1px solid rgba(255, 70, 235, 0.45);
-  background: rgba(10, 9, 22, 0.95);
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
+  scrollbar-color: rgba(232, 206, 255, 0.62) rgba(255, 255, 255, 0.04);
+  scrollbar-width: thin;
+  border-top: 1px solid rgba(255, 70, 235, 0.35);
+  background: rgba(4, 4, 14, 0.42);
 }
 
 .extra-drawer .card {
+  width: var(--extra-card-width);
   aspect-ratio: 5 / 7;
+}
+
+.extra-drawer::-webkit-scrollbar {
+  width: 6px;
+}
+
+.extra-drawer::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.extra-drawer::-webkit-scrollbar-thumb {
+  min-height: 28px;
+  border: 1px solid rgba(4, 4, 14, 0.42);
+  border-radius: 999px;
+  background: rgba(232, 206, 255, 0.62);
+}
+
+.extra-drawer::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 216, 251, 0.82);
 }
 
 .tooltip {
@@ -229,7 +275,7 @@ footer button strong {
 }
 
 .resize-handle {
-  position: absolute;
+  position: fixed;
   display: none;
   z-index: 10;
   -webkit-app-region: no-drag;
@@ -242,14 +288,14 @@ body[data-mode="edit"] .resize-handle {
 .resize-handle-east {
   top: 44px;
   right: 0;
-  bottom: 44px;
+  bottom: 0;
   width: 10px;
   cursor: ew-resize;
 }
 
 .resize-handle-west {
   top: 44px;
-  bottom: 44px;
+  bottom: 0;
   left: 0;
   width: 10px;
   cursor: ew-resize;

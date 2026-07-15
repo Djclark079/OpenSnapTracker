@@ -24,8 +24,6 @@
         <button data-view="discarded"><span>Discarded</span><strong id="counter-discarded">0</strong></button>
         <button data-view="removed"><span>Removed</span><strong id="counter-removed">0</strong></button>
       </footer>
-      <button id="extra-toggle" class="extra-toggle" title="Supplemental cards" hidden>+0</button>
-      <section id="extra-drawer" class="extra-drawer" hidden></section>
       <div id="tooltip" class="tooltip" hidden></div>
       <div class="resize-handle resize-handle-west" data-resize-edge="west" title="Resize width"></div>
       <div class="resize-handle resize-handle-east" data-resize-edge="east" title="Resize width"></div>
@@ -33,6 +31,10 @@
       <div class="resize-handle resize-handle-corner resize-handle-corner-left" data-resize-edge="south-west" title="Resize"></div>
       <div class="resize-handle resize-handle-corner" data-resize-edge="south-east" title="Resize"></div>
     </div>
+    <section id="extra-panel" class="extra-panel" hidden>
+      <button id="extra-toggle" class="extra-toggle" title="Supplemental cards">Extra Cards: 0</button>
+      <div id="extra-drawer" class="extra-drawer" hidden></div>
+    </section>
     <script>
       const { ipcRenderer } = require("electron");
       const params = new URLSearchParams(location.search);
@@ -40,6 +42,7 @@
       const title = document.getElementById("title");
       const grid = document.getElementById("grid");
       const tooltip = document.getElementById("tooltip");
+      const extraPanel = document.getElementById("extra-panel");
       const extraToggle = document.getElementById("extra-toggle");
       const extraDrawer = document.getElementById("extra-drawer");
       const debugBadge = document.getElementById("debug-badge");
@@ -59,6 +62,9 @@
       let activeResize = null;
       let mode = "interactive";
       let latestPayloadSequence = 0;
+      let lastExpansionHeight = 0;
+      let pendingExpansionRefresh = false;
+      let lastActionableSupplementalSignature = "";
 
       title.textContent = id === "player" ? "Player Deck" : "Opponent";
       debugBadge.textContent = id.toUpperCase();
@@ -139,15 +145,45 @@
 
       function renderExtraDrawer() {
         const cards = panel?.supplemental || [];
-        extraToggle.hidden = cards.length === 0;
-        extraToggle.textContent = `+${cards.length}`;
+        extraPanel.hidden = cards.length === 0;
+        extraToggle.textContent = `Extra Cards: ${cards.length}`;
         extraToggle.toggleAttribute("data-active", extraOpen && cards.length > 0);
         extraDrawer.hidden = !extraOpen || cards.length === 0;
         extraDrawer.innerHTML = "";
-        if (extraDrawer.hidden) return;
-        for (const card of cards) {
-          extraDrawer.appendChild(makeCard(card, "?"));
+        if (!extraDrawer.hidden) {
+          for (const card of cards) {
+            extraDrawer.appendChild(makeCard(card, "?"));
+          }
         }
+        requestSupplementalExpansion();
+      }
+
+      function actionableSupplementalSignature() {
+        const cards = panel?.supplemental || [];
+        return cards
+          .filter((card) => card?.knowledge !== "unknown_card" && !card?.consumed_from_deck)
+          .map((card) => `${card.card_definition_key || card.label || "?"}:${card.zone || ""}`)
+          .sort()
+          .join("|");
+      }
+
+      function requestSupplementalExpansion() {
+        if (activeResize) {
+          pendingExpansionRefresh = true;
+          return;
+        }
+        requestAnimationFrame(() => {
+          if (activeResize) {
+            pendingExpansionRefresh = true;
+            return;
+          }
+          const height = extraPanel.hidden ? 0 : Math.ceil(extraPanel.getBoundingClientRect().height);
+          document.documentElement.style.setProperty("--extra-height", `${height}px`);
+          if (height === lastExpansionHeight) return;
+          lastExpansionHeight = height;
+          ipcRenderer.send("set-supplemental-expansion", { id, height });
+          requestAnimationFrame(() => globalThis.__ostForcePaint());
+        });
       }
 
       function renderActiveFooterButton() {
@@ -160,6 +196,10 @@
         if (!activeResize) return;
         activeResize = null;
         ipcRenderer.send("resize-overlay-finished");
+        if (pendingExpansionRefresh) {
+          pendingExpansionRefresh = false;
+          requestSupplementalExpansion();
+        }
       }
 
       function render() {
@@ -220,11 +260,20 @@
         renderExtraDrawer();
       });
       ipcRenderer.on("overlay-payload", (_event, payload) => {
-        panel = payload.panel;
+        const nextPanel = payload.panel;
+        if (!nextPanel) {
+          currentView = "deck";
+          extraOpen = false;
+        }
+        panel = nextPanel;
         latestPayloadSequence = payload.sequence || latestPayloadSequence;
         debugBadge.textContent = panel ? `${id.toUpperCase()} DATA` : id.toUpperCase();
-        currentView = "deck";
         if ((panel?.supplemental || []).length === 0) extraOpen = false;
+        const actionableSignature = actionableSupplementalSignature();
+        if (id === "opponent" && actionableSignature && actionableSignature !== lastActionableSupplementalSignature) {
+          extraOpen = true;
+        }
+        lastActionableSupplementalSignature = actionableSignature;
         render();
         if (latestBounds) {
           debugLine.textContent = `${id} | ${mode} | ${latestBounds.x},${latestBounds.y} ${latestBounds.width}x${latestBounds.height} | update ${latestPayloadSequence}`;
@@ -234,6 +283,12 @@
         mode = nextMode;
         document.body.dataset.mode = mode;
         if (mode === "passthrough") hideTooltip();
+      });
+      ipcRenderer.on("supplemental-expansion-reset", () => {
+        extraOpen = false;
+        lastExpansionHeight = 0;
+        document.documentElement.style.setProperty("--extra-height", "0px");
+        renderExtraDrawer();
       });
       ipcRenderer.on("debug-state", (_event, state) => {
         const bounds = state.bounds;
@@ -285,6 +340,7 @@
       window.addEventListener("pointerup", finishResize);
       window.addEventListener("pointercancel", finishResize);
       window.addEventListener("blur", finishResize);
+      window.addEventListener("resize", requestSupplementalExpansion);
       render();
     </script>
   </body>

@@ -8,6 +8,7 @@ members = [
     "crates/tracker-sidecar",
     "crates/state-reader",
     "crates/storage",
+    "crates/x11-focus-helper",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ tempfile = "3.23"
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "macros", "serde", "serde-well-known"] }
 walkdir = "2.5"
+x11rb = "0.13"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

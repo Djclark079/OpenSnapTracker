@@ -2,7 +2,7 @@ import { app, BrowserWindow, globalShortcut, ipcMain, screen } from "electron";
 import path from "node:path";
 import fs from "node:fs";
 import { createHash } from "node:crypto";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 
 type OverlayId = "player" | "opponent";
 type Mode = "interactive" | "passthrough" | "edit";
@@ -23,6 +23,7 @@ type ResizeStartRequest = {
 type ActiveResize = {
   edge: ResizeEdge;
   startBounds: Geometry;
+  startExpansionHeight: number;
   startScreenX: number;
   startScreenY: number;
 };
@@ -36,6 +37,24 @@ type SidecarEvent = {
   source?: string;
   changed?: boolean;
   game_hash?: string | null;
+  reason?: string;
+};
+type FocusHelperWindow = {
+  id: string;
+  id_decimal: number;
+  title?: string | null;
+  class?: string | null;
+  instance?: string | null;
+  mapped: boolean;
+};
+type FocusHelperActivateResult = {
+  activated: boolean;
+  window?: FocusHelperWindow | null;
+  candidates?: FocusHelperWindow[];
+};
+type FocusBounceOptions = {
+  minIntervalMs?: number;
+  settle?: boolean;
 };
 
 const minWidth = 288;
@@ -49,7 +68,8 @@ const screenEdgeReserve = 20;
 
 let mode: Mode = process.argv.includes("--start-edit") ? "edit" : "interactive";
 const windows = new Map<OverlayId, BrowserWindow>();
-const lastBounds = new Map<OverlayId, Geometry>();
+const baseBounds = new Map<OverlayId, Geometry>();
+const expansionHeights = new Map<OverlayId, number>();
 const activeResizes = new Map<OverlayId, ActiveResize>();
 let overlayPayload: OverlayPayload | null = null;
 let overlayPayloadHash: string | null = null;
@@ -57,6 +77,13 @@ let overlayPayloadSequence = 0;
 let overlayPayloadPollTimer: NodeJS.Timeout | null = null;
 let sidecar: ChildProcess | null = null;
 let overlayPayloadWatchPath: string | null = null;
+let lastFocusBounceAt = 0;
+let focusBounceInFlight = false;
+let delayedFocusBounceTimer: NodeJS.Timeout | null = null;
+let delayedFocusBounceReason: string | null = null;
+let resolutionBounceTimer: NodeJS.Timeout | null = null;
+let resolutionBounceStartedAt = 0;
+let resolutionBounceActive = false;
 
 if (process.platform === "linux") {
   app.disableHardwareAcceleration();
@@ -111,12 +138,15 @@ function enforceMinimumGeometry(geometry: Geometry): Geometry {
   };
 }
 
-function maxSizeForGeometry(geometry: Geometry): Pick<Geometry, "width" | "height"> {
+function maxSizeForGeometry(
+  geometry: Geometry,
+  expansionHeight = 0
+): Pick<Geometry, "width" | "height"> {
   const display = screen.getDisplayMatching(geometry);
-  const availableBelow = display.workArea.y + display.workArea.height - geometry.y - screenEdgeReserve;
+  const maxDisplayHeight = display.workArea.height - maxVerticalReserve - expansionHeight;
   const maxHeight = Math.max(
     minHeight,
-    Math.min(display.workArea.height - maxVerticalReserve, availableBelow)
+    Math.min(maxDisplayHeight, Math.round((display.workArea.width - maxHorizontalReserve) / overlayAspectRatio))
   );
   const maxWidth = Math.max(minWidth, display.workArea.width - maxHorizontalReserve);
   const heightFromWidth = Math.round(maxWidth / overlayAspectRatio);
@@ -124,6 +154,53 @@ function maxSizeForGeometry(geometry: Geometry): Pick<Geometry, "width" | "heigh
   return {
     width: Math.round(height * overlayAspectRatio),
     height
+  };
+}
+
+function clampResizeGeometryToDisplay(
+  geometry: Geometry,
+  expansionHeight: number,
+  anchorRight: boolean
+): Geometry {
+  const display = screen.getDisplayMatching(geometry);
+  const topLimit = display.workArea.y + screenEdgeReserve;
+  const bottomLimit = display.workArea.y + display.workArea.height - screenEdgeReserve;
+  const maxSize = maxSizeForGeometry(geometry, expansionHeight);
+  const baseHeight = Math.min(
+    Math.max(minHeight, geometry.height),
+    maxSize.height,
+    Math.max(minHeight, bottomLimit - topLimit - expansionHeight)
+  );
+  const baseWidth = Math.round(baseHeight * overlayAspectRatio);
+  let x = anchorRight ? geometry.x + geometry.width - baseWidth : geometry.x;
+  let y = geometry.y;
+  const bottomOverflow = y + baseHeight + expansionHeight - bottomLimit;
+  if (bottomOverflow > 0) {
+    y -= bottomOverflow;
+  }
+  if (y < topLimit) {
+    y = topLimit;
+  }
+  return {
+    x,
+    y,
+    width: baseWidth,
+    height: baseHeight
+  };
+}
+
+function totalBounds(id: OverlayId, geometry: Geometry): Geometry {
+  return {
+    ...geometry,
+    height: geometry.height + (expansionHeights.get(id) ?? 0)
+  };
+}
+
+function currentBaseBounds(id: OverlayId, win: BrowserWindow): Geometry {
+  const bounds = win.getBounds();
+  return {
+    ...bounds,
+    height: Math.max(minHeight, bounds.height - (expansionHeights.get(id) ?? 0))
   };
 }
 
@@ -141,8 +218,8 @@ function clampGeometrySizeToDisplay(geometry: Geometry, anchorRight = false): Ge
 
 function writeGeometry(): void {
   const data: Partial<GeometryStore> = {};
-  for (const [id, win] of windows) {
-    data[id] = win.getBounds();
+  for (const [id] of windows) {
+    data[id] = baseBounds.get(id);
   }
   fs.mkdirSync(path.dirname(geometryPath()), { recursive: true });
   fs.writeFileSync(geometryPath(), JSON.stringify(data, null, 2));
@@ -196,22 +273,30 @@ function resizeGeometry(request: ResizeRequest, activeResize: ActiveResize): Geo
     x = startBounds.x + startBounds.width - width;
   }
 
-  return clampGeometrySizeToDisplay({
+  const candidate = {
     x,
     y: startBounds.y,
     width,
     height
-  }, activeResize.edge === "west" || activeResize.edge === "south-west");
+  };
+  return clampResizeGeometryToDisplay(
+    candidate,
+    activeResize.startExpansionHeight,
+    activeResize.edge === "west" || activeResize.edge === "south-west"
+  );
 }
 
 function startCustomResize(request: ResizeStartRequest): void {
   if (mode !== "edit") return;
   const win = windows.get(request.id);
   if (!win || win.isDestroyed()) return;
+  const currentBase = currentBaseBounds(request.id, win);
+  baseBounds.set(request.id, currentBase);
 
   activeResizes.set(request.id, {
     edge: request.edge,
-    startBounds: win.getBounds(),
+    startBounds: currentBase,
+    startExpansionHeight: expansionHeights.get(request.id) ?? 0,
     startScreenX: request.startScreenX,
     startScreenY: request.startScreenY
   });
@@ -225,14 +310,15 @@ function applyCustomResize(request: ResizeRequest): void {
   if (!activeResize) return;
 
   const bounds = resizeGeometry(request, activeResize);
-  win.setBounds(bounds);
-  win.webContents.send("debug-state", { id: request.id, mode, bounds });
+  baseBounds.set(request.id, bounds);
+  win.setBounds(totalBounds(request.id, bounds));
+  win.webContents.send("debug-state", { id: request.id, mode, bounds: totalBounds(request.id, bounds) });
 }
 
 function finishCustomResize(): void {
   for (const [id, win] of windows) {
     if (!win.isDestroyed()) {
-      lastBounds.set(id, win.getBounds());
+      baseBounds.set(id, currentBaseBounds(id, win));
     }
   }
   activeResizes.clear();
@@ -242,8 +328,10 @@ function finishCustomResize(): void {
 function resetGeometry(): void {
   const geometry = defaultGeometry();
   for (const [id, win] of windows) {
+    expansionHeights.set(id, 0);
+    baseBounds.set(id, geometry[id]);
     win.setBounds(geometry[id]);
-    lastBounds.set(id, geometry[id]);
+    win.webContents.send("supplemental-expansion-reset");
     win.show();
     logBounds(id, win, "reset");
   }
@@ -271,6 +359,8 @@ function clampToDisplays(geometry: Geometry): Geometry {
 function logBounds(id: OverlayId, win: BrowserWindow, event: string): void {
   console.log(`[overlay:${id}] ${event}`, {
     bounds: win.getBounds(),
+    baseBounds: baseBounds.get(id),
+    expansionHeight: expansionHeights.get(id) ?? 0,
     visible: win.isVisible(),
     focused: win.isFocused(),
     mode
@@ -287,6 +377,189 @@ function liveStateDir(): string | undefined {
   const arg = process.argv.find((value) => value.startsWith("--live-state-dir="));
   const fromArg = arg?.slice("--live-state-dir=".length);
   return fromArg || process.env.OST_LIVE_STATE_DIR;
+}
+
+function focusBounceEnabled(): boolean {
+  return process.argv.includes("--focus-bounce") || process.env.OST_FOCUS_BOUNCE === "1";
+}
+
+function gameStatePath(): string | null {
+  const stateDir = liveStateDir();
+  return stateDir ? path.join(stateDir, "GameState.json") : null;
+}
+
+function fileFingerprint(filePath: string | null): string | null {
+  if (!filePath || !fs.existsSync(filePath)) return null;
+  try {
+    const stat = fs.statSync(filePath);
+    const hash = createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+    return `${stat.mtimeMs}:${stat.size}:${hash.slice(0, 12)}`;
+  } catch {
+    return null;
+  }
+}
+
+function repoRoot(): string {
+  return path.resolve(__dirname, "../../..");
+}
+
+function focusHelperInvocation(extraArgs: string[]): { command: string; args: string[]; cwd?: string } {
+  const configured = process.env.OST_FOCUS_HELPER;
+  if (configured) {
+    return { command: configured, args: extraArgs };
+  }
+
+  const packagedHelper = path.join(process.resourcesPath, "x11-focus-helper");
+  if (app.isPackaged && fs.existsSync(packagedHelper)) {
+    return { command: packagedHelper, args: extraArgs };
+  }
+
+  return {
+    command: "cargo",
+    args: ["run", "-q", "-p", "x11-focus-helper", "--", ...extraArgs],
+    cwd: repoRoot()
+  };
+}
+
+function activateSnapWindow(
+  callback: (result: FocusHelperActivateResult | null, error: Error | null) => void
+): void {
+  const args = ["activate", "--title", process.env.OST_SNAP_WINDOW_TITLE || "SNAP"];
+  const configuredWindow = process.env.OST_SNAP_WINDOW_ID;
+  if (configuredWindow) {
+    args.push("--window", configuredWindow);
+  }
+
+  const invocation = focusHelperInvocation(args);
+  execFile(invocation.command, invocation.args, { cwd: invocation.cwd }, (error, stdout, stderr) => {
+    if (error) {
+      const message = stderr.trim() || error.message;
+      callback(null, new Error(message));
+      return;
+    }
+
+    try {
+      callback(JSON.parse(stdout) as FocusHelperActivateResult, null);
+    } catch (parseError) {
+      callback(null, parseError instanceof Error ? parseError : new Error(String(parseError)));
+    }
+  });
+}
+
+function scheduleFocusBounce(reason: string, delayMs: number): void {
+  delayedFocusBounceReason = reason;
+  if (delayedFocusBounceTimer) return;
+
+  delayedFocusBounceTimer = setTimeout(() => {
+    const nextReason = delayedFocusBounceReason ?? "hidden-zone-change";
+    delayedFocusBounceTimer = null;
+    delayedFocusBounceReason = null;
+    requestFocusBounce(nextReason);
+  }, delayMs);
+}
+
+function scheduleSettledFocusBounce(reason: string): void {
+  if (reason.endsWith(":settle")) return;
+  scheduleFocusBounce(`${reason}:settle`, 1500);
+}
+
+function requestFocusBounce(reason: string, options: FocusBounceOptions = {}): void {
+  if (!focusBounceEnabled()) return;
+  const now = Date.now();
+  const minIntervalMs = options.minIntervalMs ?? 1200;
+  const settle = options.settle ?? true;
+  if (focusBounceInFlight || now - lastFocusBounceAt < minIntervalMs) {
+    const retryDelay = focusBounceInFlight
+      ? 350
+      : Math.max(150, minIntervalMs + 50 - (now - lastFocusBounceAt));
+    console.log("[overlay-spike] focus bounce skipped", {
+      reason,
+      inFlight: focusBounceInFlight,
+      sinceMs: now - lastFocusBounceAt,
+      retryDelay
+    });
+    if (settle) {
+      scheduleFocusBounce(reason, retryDelay);
+    }
+    return;
+  }
+
+  const visibleWindow = [...windows.values()].find((win) => !win.isDestroyed() && win.isVisible());
+  if (!visibleWindow) return;
+
+  focusBounceInFlight = true;
+  lastFocusBounceAt = now;
+  const before = fileFingerprint(gameStatePath());
+  visibleWindow.focus();
+
+  setTimeout(() => {
+    activateSnapWindow((result, error) => {
+      if (error) {
+        console.warn("[overlay-spike] focus bounce helper failed", {
+          reason,
+          message: error.message
+        });
+        focusBounceInFlight = false;
+        return;
+      }
+
+      if (!result?.activated || !result.window) {
+        console.warn("[overlay-spike] focus bounce could not find SNAP window", {
+          reason,
+          candidates: result?.candidates?.slice(-8) ?? []
+        });
+        focusBounceInFlight = false;
+        return;
+      }
+
+      setTimeout(() => {
+        const after = fileFingerprint(gameStatePath());
+        console.log("[overlay-spike] focus bounce completed", {
+          reason,
+          snapWindow: result.window,
+          gameStateChanged: before !== after,
+          before,
+          after
+        });
+        focusBounceInFlight = false;
+        if (settle) {
+          scheduleSettledFocusBounce(reason);
+        }
+      }, 250);
+    });
+  }, 50);
+}
+
+function requestResolutionBounce(): void {
+  requestFocusBounce("resolution-loop", {
+    minIntervalMs: 450,
+    settle: false
+  });
+}
+
+function startResolutionBounceLoop(): void {
+  if (resolutionBounceActive) return;
+  resolutionBounceActive = true;
+  resolutionBounceStartedAt = Date.now();
+  console.log("[overlay-spike] resolution bounce loop started");
+  requestResolutionBounce();
+  resolutionBounceTimer = setInterval(() => {
+    if (Date.now() - resolutionBounceStartedAt > 30000) {
+      stopResolutionBounceLoop("max-duration");
+      return;
+    }
+    requestResolutionBounce();
+  }, 500);
+}
+
+function stopResolutionBounceLoop(reason: string): void {
+  if (!resolutionBounceActive && !resolutionBounceTimer) return;
+  if (resolutionBounceTimer) {
+    clearInterval(resolutionBounceTimer);
+    resolutionBounceTimer = null;
+  }
+  resolutionBounceActive = false;
+  console.log("[overlay-spike] resolution bounce loop stopped", { reason });
 }
 
 function defaultLivePayloadPath(): string {
@@ -434,12 +707,34 @@ function handleSidecarEventLine(line: string): void {
     return;
   }
 
+  if (event.event === "focus-bounce-requested") {
+    const reason = event.reason ?? "hidden-zone-change";
+    console.log("[tracker-sidecar] focus-bounce-requested", {
+      reason
+    });
+    if (reason === "resolution-started") {
+      startResolutionBounceLoop();
+    } else if (reason === "turn-start") {
+      stopResolutionBounceLoop(reason);
+      scheduleFocusBounce(reason, 250);
+    } else if (reason === "match-ended") {
+      stopResolutionBounceLoop(reason);
+      scheduleFocusBounce(reason, 250);
+    } else {
+      requestFocusBounce(reason);
+    }
+    return;
+  }
+
   console.log("[tracker-sidecar]", event);
 }
 
 function createOverlay(id: OverlayId, geometry: Geometry): BrowserWindow {
+  const base = clampToDisplays(geometry);
+  baseBounds.set(id, base);
+  expansionHeights.set(id, 0);
   const win = new BrowserWindow({
-    ...clampToDisplays(geometry),
+    ...base,
     minWidth,
     minHeight,
     frame: false,
@@ -459,7 +754,6 @@ function createOverlay(id: OverlayId, geometry: Geometry): BrowserWindow {
   });
 
   win.setAlwaysOnTop(true, "screen-saver");
-  win.setAspectRatio(overlayAspectRatio);
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   win.loadFile(path.join(__dirname, "../src/index.html"), { query: { id } });
   win.once("ready-to-show", () => {
@@ -477,7 +771,7 @@ function createOverlay(id: OverlayId, geometry: Geometry): BrowserWindow {
     });
   });
   win.on("moved", () => {
-    lastBounds.set(id, win.getBounds());
+    baseBounds.set(id, currentBaseBounds(id, win));
     logBounds(id, win, "moved");
     writeGeometry();
   });
@@ -485,9 +779,30 @@ function createOverlay(id: OverlayId, geometry: Geometry): BrowserWindow {
     logBounds(id, win, "resized");
   });
   windows.set(id, win);
-  lastBounds.set(id, win.getBounds());
   logBounds(id, win, "created");
   return win;
+}
+
+function setSupplementalExpansion(id: OverlayId, requestedHeight: number): void {
+  const win = windows.get(id);
+  if (!win || win.isDestroyed()) return;
+  const nextHeight = Math.max(0, Math.round(requestedHeight));
+  if ((expansionHeights.get(id) ?? 0) === nextHeight) return;
+  const base = currentBaseBounds(id, win);
+  baseBounds.set(id, base);
+  expansionHeights.set(id, nextHeight);
+  const maxSize = maxSizeForGeometry(base, nextHeight);
+  const baseHeight = Math.min(base.height, maxSize.height);
+  const width = Math.min(base.width, Math.round(baseHeight * overlayAspectRatio));
+  const clampedBase = {
+    ...base,
+    width,
+    height: baseHeight
+  };
+  baseBounds.set(id, clampedBase);
+  win.setBounds(totalBounds(id, clampedBase));
+  win.webContents.send("debug-state", { id, mode, bounds: win.getBounds() });
+  writeGeometry();
 }
 
 function applyMode(next: Mode): void {
@@ -530,6 +845,9 @@ app.whenReady().then(() => {
   );
   ipcMain.on("resize-overlay", (_event, request: ResizeRequest) => applyCustomResize(request));
   ipcMain.on("resize-overlay-finished", finishCustomResize);
+  ipcMain.on("set-supplemental-expansion", (_event, request: { id: OverlayId; height: number }) =>
+    setSupplementalExpansion(request.id, request.height)
+  );
   applyMode(mode);
 });
 
@@ -539,6 +857,12 @@ app.on("will-quit", () => {
   }
   if (overlayPayloadPollTimer) {
     clearInterval(overlayPayloadPollTimer);
+  }
+  if (delayedFocusBounceTimer) {
+    clearTimeout(delayedFocusBounceTimer);
+  }
+  if (resolutionBounceTimer) {
+    clearInterval(resolutionBounceTimer);
   }
   if (sidecar && !sidecar.killed) {
     sidecar.kill();

@@ -2,12 +2,13 @@ mod live_log;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use domain::{CardInstanceId, CardKey, CardKnowledge, Zone};
+use domain::{CardInstanceId, CardKey, CardKnowledge, MatchLifecycle, Participant, Zone};
 use live_log::{LiveLogState, parse_live_log_line};
 use state_reader::{
     OverlayProjector, ReadOptions, ReconciliationInput, SnapshotObservation, TextOverlayCard,
-    TextOverlayPayload, TextOverlaySlot, TextOverlaySlotState, observe_game_state,
-    read_json_snapshot, reconcile_observation, text_overlay_payload,
+    TextOverlayCounters, TextOverlayPanel, TextOverlayPayload, TextOverlaySlot,
+    TextOverlaySlotState, observe_game_state, read_json_snapshot, reconcile_observation,
+    text_overlay_payload,
 };
 use std::{
     cmp::Reverse,
@@ -69,6 +70,8 @@ struct LiveTracker {
     current_payload: Option<TextOverlayPayload>,
     projector: OverlayProjector,
     last_update_source: Option<&'static str>,
+    pending_focus_bounce_reasons: Vec<String>,
+    pending_opponent_discard_clues: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +111,12 @@ fn main() -> Result<()> {
                         "event": "payload-written",
                         "path": tracker.output_json.display().to_string(),
                         "source": tracker.last_update_source,
+                    }))?;
+                }
+                for reason in tracker.take_focus_bounce_reasons() {
+                    emit_stdout_event(&serde_json::json!({
+                        "event": "focus-bounce-requested",
+                        "reason": reason,
                     }))?;
                 }
                 if args.stdout_events
@@ -164,6 +173,8 @@ impl LiveTracker {
             current_payload: None,
             projector: OverlayProjector::new(),
             last_update_source: None,
+            pending_focus_bounce_reasons: Vec::new(),
+            pending_opponent_discard_clues: 0,
         }
     }
 
@@ -171,21 +182,36 @@ impl LiveTracker {
         self.refresh_play_state()?;
         self.refresh_collection_decks()?;
         let log_changed = self.refresh_player_log()?;
+        let snapshot_changed = if self.current_payload.is_some() {
+            self.refresh_game_state_snapshot()?
+        } else {
+            false
+        };
 
         if self.current_payload.is_none() {
             self.seed_payload_from_game_state()?;
             self.write_current_payload()?;
-            self.last_update_source = if log_changed {
-                Some("game-state-seed+player-log")
+            self.last_update_source = if log_changed || snapshot_changed {
+                Some("game-state-seed+live")
             } else {
                 Some("game-state-seed")
             };
             return Ok(true);
         }
 
-        if log_changed {
-            self.write_current_payload()?;
-            self.last_update_source = Some("player-log");
+        if log_changed || snapshot_changed {
+            if snapshot_changed {
+                self.write_current_snapshot_payload()?;
+            } else {
+                self.write_current_payload()?;
+            }
+            self.last_update_source = if log_changed && snapshot_changed {
+                Some("player-log+game-state")
+            } else if log_changed {
+                Some("player-log")
+            } else {
+                Some("game-state")
+            };
             return Ok(true);
         }
 
@@ -285,11 +311,93 @@ impl LiveTracker {
         let mut changed = false;
         for line in text.lines() {
             if let Some(event) = parse_live_log_line(line) {
+                match &event {
+                    live_log::LiveLogEvent::OpponentDiscardClue => {
+                        self.pending_opponent_discard_clues =
+                            self.pending_opponent_discard_clues.saturating_add(1);
+                    }
+                    live_log::LiveLogEvent::ResolutionStarted => {
+                        self.pending_focus_bounce_reasons
+                            .push("resolution-started".to_string());
+                    }
+                    live_log::LiveLogEvent::TurnStarted => {
+                        self.pending_focus_bounce_reasons
+                            .push("turn-start".to_string());
+                    }
+                    live_log::LiveLogEvent::MatchEnded | live_log::LiveLogEvent::MatchLeft => {
+                        self.pending_focus_bounce_reasons
+                            .push("match-ended".to_string());
+                    }
+                    _ => {}
+                }
+                let reset_payload = matches!(
+                    event,
+                    live_log::LiveLogEvent::MatchStarted { .. } | live_log::LiveLogEvent::MatchLeft
+                );
                 changed |= self.live_log_state.apply(event);
+                if reset_payload {
+                    self.reset_current_match_payload();
+                    changed = true;
+                }
             }
         }
         self.previous_log_position = Some(len);
         Ok(changed)
+    }
+
+    fn take_focus_bounce_reasons(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_focus_bounce_reasons)
+    }
+
+    fn refresh_game_state_snapshot(&mut self) -> Result<bool> {
+        let snapshot = match read_json_snapshot(&self.state_file, ReadOptions::default()) {
+            Ok(snapshot) => snapshot,
+            Err(state_reader::SnapshotReadError::Io { .. }) => return Ok(false),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", self.state_file.display()));
+            }
+        };
+        if self.previous_hash.as_deref() == Some(snapshot.sha256.as_str()) {
+            return Ok(false);
+        }
+
+        let observation = observe_game_state(&snapshot.parsed)
+            .with_context(|| format!("observe {}", self.state_file.display()))?;
+        let previous_observation = self.previous_observation.clone();
+        let events = reconcile_observation(ReconciliationInput {
+            previous: previous_observation.as_ref(),
+            current: &observation,
+            snapshot_version: Some(snapshot.sha256.clone()),
+        });
+        let projection = self.projector.project(&observation, &events);
+        let mut payload = text_overlay_payload(&projection);
+        self.enrich_player_deck(&mut payload);
+
+        for card in &observation.cards {
+            if card.owner == Participant::Player
+                && card.raw_zone.as_deref() == Some("Banished")
+                && let Some(key) = &card.card_definition_key
+            {
+                self.live_log_state
+                    .apply(live_log::LiveLogEvent::PlayerCardRemoved { key: key.clone() });
+            }
+        }
+        if self.pending_opponent_discard_clues > 0 {
+            for key in
+                opponent_graveyard_discard_candidates(previous_observation.as_ref(), &observation)
+                    .into_iter()
+                    .take(self.pending_opponent_discard_clues)
+            {
+                self.live_log_state
+                    .apply(live_log::LiveLogEvent::OpponentCardDiscarded { key });
+                self.pending_opponent_discard_clues =
+                    self.pending_opponent_discard_clues.saturating_sub(1);
+            }
+        }
+        self.current_payload = Some(payload);
+        self.previous_hash = Some(snapshot.sha256);
+        self.previous_observation = Some(observation);
+        Ok(true)
     }
 
     fn enrich_player_deck(&mut self, payload: &mut TextOverlayPayload) {
@@ -304,7 +412,7 @@ impl LiveTracker {
                 .cloned()
         {
             self.live_log_state.set_player_deck(deck.cards.clone());
-            self.apply_player_deck(payload, &deck);
+            Self::apply_player_deck(payload, &deck);
             self.matched_player_deck = Some(deck);
             return;
         }
@@ -327,10 +435,10 @@ impl LiveTracker {
             return;
         };
         self.live_log_state.set_player_deck(deck.cards.clone());
-        self.apply_player_deck(payload, deck);
+        Self::apply_player_deck(payload, deck);
     }
 
-    fn apply_player_deck(&self, payload: &mut TextOverlayPayload, deck: &CollectionDeck) {
+    fn apply_player_deck(payload: &mut TextOverlayPayload, deck: &CollectionDeck) {
         let observed_by_key = payload
             .player
             .deck_slots
@@ -368,10 +476,90 @@ impl LiveTracker {
             return Ok(());
         };
         self.enrich_player_deck(&mut payload);
+        self.live_log_state.seed_counters_from_payload(&payload);
         self.live_log_state.apply_to_payload(&mut payload);
         write_json_atomic(&self.output_json, &serde_json::to_vec_pretty(&payload)?)?;
         self.current_payload = Some(payload);
         Ok(())
+    }
+
+    fn write_current_snapshot_payload(&mut self) -> Result<()> {
+        let Some(mut payload) = self.current_payload.take() else {
+            return Ok(());
+        };
+        self.enrich_player_deck(&mut payload);
+        self.live_log_state.seed_counters_from_payload(&payload);
+        self.live_log_state.apply_to_snapshot_payload(&mut payload);
+        write_json_atomic(&self.output_json, &serde_json::to_vec_pretty(&payload)?)?;
+        self.current_payload = Some(payload);
+        Ok(())
+    }
+
+    fn reset_current_match_payload(&mut self) {
+        self.previous_hash = None;
+        self.previous_observation = None;
+        self.projector = OverlayProjector::new();
+        self.pending_opponent_discard_clues = 0;
+        self.pending_focus_bounce_reasons.clear();
+        self.current_payload = Some(blank_overlay_payload());
+        if let Some(deck) = self
+            .selected_deck_id
+            .as_ref()
+            .and_then(|selected_deck_id| {
+                self.collection_decks
+                    .iter()
+                    .find(|deck| deck.id == *selected_deck_id)
+                    .cloned()
+            })
+            .or_else(|| self.matched_player_deck.clone())
+        {
+            self.live_log_state.set_player_deck(deck.cards.clone());
+            if let Some(payload) = self.current_payload.as_mut() {
+                Self::apply_player_deck(payload, &deck);
+            }
+            self.matched_player_deck = Some(deck);
+        }
+    }
+}
+
+fn blank_overlay_payload() -> TextOverlayPayload {
+    TextOverlayPayload {
+        schema_version: 1,
+        lifecycle: MatchLifecycle::Unknown,
+        turn: None,
+        total_turns: None,
+        player: blank_overlay_panel(Participant::Player, "Player Deck"),
+        opponent: blank_overlay_panel(Participant::Opponent, "Opponent"),
+        warnings: Vec::new(),
+    }
+}
+
+fn blank_overlay_panel(participant: Participant, title: &str) -> TextOverlayPanel {
+    TextOverlayPanel {
+        participant,
+        title: title.to_string(),
+        deck_slots: (0u8..12)
+            .map(|slot_index| TextOverlaySlot {
+                slot_index,
+                state: TextOverlaySlotState::Unknown,
+                card: None,
+            })
+            .collect(),
+        supplemental: Vec::new(),
+        destroyed: Vec::new(),
+        discarded: Vec::new(),
+        removed: Vec::new(),
+        unknown_transition: Vec::new(),
+        counters: TextOverlayCounters {
+            deck: 0,
+            hand: 0,
+            board: 0,
+            destroyed: 0,
+            discarded: 0,
+            removed: 0,
+            supplemental: 0,
+            unknown_transition: 0,
+        },
     }
 }
 
@@ -485,6 +673,30 @@ fn deck_text_card(index: usize, key: &CardKey) -> TextOverlayCard {
         original_deck_candidate: true,
         consumed_from_deck: false,
     }
+}
+
+fn opponent_graveyard_discard_candidates(
+    previous: Option<&SnapshotObservation>,
+    current: &SnapshotObservation,
+) -> Vec<CardKey> {
+    let previous_graveyard = previous
+        .into_iter()
+        .flat_map(|observation| &observation.cards)
+        .filter(|card| {
+            card.owner == Participant::Opponent && card.raw_zone.as_deref() == Some("Graveyard")
+        })
+        .filter_map(|card| card.card_definition_key.clone())
+        .collect::<HashSet<_>>();
+
+    current
+        .cards
+        .iter()
+        .filter(|card| {
+            card.owner == Participant::Opponent && card.raw_zone.as_deref() == Some("Graveyard")
+        })
+        .filter_map(|card| card.card_definition_key.clone())
+        .filter(|key| !previous_graveyard.contains(key))
+        .collect()
 }
 
 #[cfg(test)]
@@ -663,6 +875,102 @@ mod tests {
     }
 
     #[test]
+    fn banished_snapshot_cards_are_projected_as_removed() {
+        let temp = tempdir().expect("tempdir");
+        let state_dir = temp.path().to_path_buf();
+        let state_file = state_dir.join(GAME_STATE_FILENAME);
+        let output_json = temp.path().join("overlay.json");
+        let mut game_state: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-active-turn.json"
+        ))
+        .expect("fixture parses");
+
+        game_state["RemoteGame"]["ClientGameInfo"] = serde_json::json!({
+            "LocalPlayerEntityId": 2,
+            "EnemyPlayerEntityId": 7
+        });
+        game_state["RemoteGame"]["GameState"]["_players"][0]["Banished"]["_cards"] =
+            serde_json::json!([{ "$ref": "11" }]);
+        game_state["RemoteGame"]["GameState"]["_players"][0]["Hand"]["_cards"] =
+            serde_json::json!([]);
+        game_state["RemoteGame"]["GameState"]["CardsByEntityId"]["21"]["CardDefId"] =
+            serde_json::json!("Brood");
+        game_state["RemoteGame"]["GameState"]["CardsByEntityId"]["21"]["_zone"] =
+            serde_json::json!({ "$ref": "6" });
+
+        fs::write(&state_file, game_state.to_string()).expect("write fixture");
+        let mut tracker = LiveTracker::new(state_dir, output_json.clone(), Duration::ZERO);
+        let deck = CollectionDeck {
+            id: "deck".to_string(),
+            name: "Fixture Deck".to_string(),
+            cards: vec![
+                CardKey("Brood".to_string()),
+                CardKey("SilverSurfer".to_string()),
+            ],
+        };
+        tracker.live_log_state.set_player_deck(deck.cards.clone());
+        tracker.collection_decks = vec![deck.clone()];
+        tracker.selected_deck_id = Some(deck.id.clone());
+        tracker.matched_player_deck = Some(deck);
+        tracker.current_payload = Some(blank_overlay_payload());
+
+        assert!(
+            tracker
+                .refresh_game_state_snapshot()
+                .expect("refresh game state")
+        );
+        tracker
+            .write_current_snapshot_payload()
+            .expect("write payload");
+
+        let payload: TextOverlayPayload =
+            serde_json::from_slice(&fs::read(output_json).expect("read payload"))
+                .expect("payload parses");
+        assert_eq!(payload.player.counters.removed, 1);
+        assert_eq!(payload.player.removed[0].label, "Brood");
+        assert!(
+            payload
+                .player
+                .deck_slots
+                .iter()
+                .filter_map(|slot| slot.card.as_ref())
+                .any(|card| card.label == "Brood" && card.consumed_from_deck)
+        );
+    }
+
+    #[test]
+    fn opponent_graveyard_candidates_only_include_new_opponent_cards() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshots/sanitized-active-turn.json"
+        ))
+        .expect("fixture parses");
+        let mut previous = observe_game_state(&fixture).expect("previous observation");
+        let mut current = previous.clone();
+
+        previous.cards.push(observed_card(
+            "prev-opponent-grave",
+            "OldOpponentDiscard",
+            Participant::Opponent,
+        ));
+        current.cards = previous.cards.clone();
+        current.cards.push(observed_card(
+            "new-opponent-grave",
+            "ArnimZola",
+            Participant::Opponent,
+        ));
+        current.cards.push(observed_card(
+            "new-player-grave",
+            "LadySif",
+            Participant::Player,
+        ));
+
+        assert_eq!(
+            opponent_graveyard_discard_candidates(Some(&previous), &current),
+            vec![CardKey("ArnimZola".to_string())]
+        );
+    }
+
+    #[test]
     fn parses_current_and_legacy_selected_deck_shapes() {
         assert_eq!(
             parse_selected_deck_id(&serde_json::json!({
@@ -678,5 +986,23 @@ mod tests {
             })),
             Some("legacy-id".to_string())
         );
+    }
+
+    fn observed_card(
+        id: &str,
+        key: &str,
+        participant: Participant,
+    ) -> state_reader::CardObservation {
+        state_reader::CardObservation {
+            entity_id: id.bytes().map(i64::from).sum(),
+            card_definition_key: Some(CardKey(key.to_string())),
+            owner: participant,
+            raw_zone: Some("Graveyard".to_string()),
+            domain_zone: Zone::Discarded,
+            previous_raw_zone: None,
+            previous_domain_zone: None,
+            zone_position: None,
+            started_in_deck_entity_id: Some(1),
+        }
     }
 }

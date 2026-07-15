@@ -17,7 +17,6 @@ Build and test:
 - `cargo test --workspace`
 - `cargo build --workspace`
 - Electron spike: `cd apps/electron-spike && npm install && npm run typecheck && npm run build`
-- Tauri spike: `cd apps/tauri-spike && npm install && npm run typecheck && npm run build`
 
 State capture:
 - Default Proton path: `~/.steam/steam/steamapps/compatdata/1997040/pfx/drive_c/users/steamuser/AppData/LocalLow/Second Dinner/SNAP/Standalone/States/nvprod`
@@ -27,5 +26,4 @@ State capture:
 Generated or third-party files:
 - Do not edit `Cargo.lock` manually.
 - Do not edit `package-lock.json` manually.
-- Do not edit `apps/tauri-spike/src-tauri/gen/` generated schema files.
 - Do not unpack or modify the supplied reference zip archives unless explicitly needed for inspection.

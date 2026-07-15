@@ -1,7 +1,7 @@
 # Session handoff
 
 ## Work completed
-- Electron is the selected v1 shell; Tauri remains documented comparison evidence.
+- Electron is the selected v1 shell; Tauri remains documented comparison evidence only.
 - Live Electron overlay now uses a Rust sidecar plus text-only payloads for player and opponent deck panels, counters, zone views, and supplemental-card drawers.
 - Player deck title and full 12-card list are seeded from `PlayState.json` selected deck ids joined to `CollectionState.json`.
 - `Player.log` parser handles live visible movement signals, match reset signals, opponent discard clues, The Peak away-state heuristic, self-returning discard cards, supplemental-card detection, and opponent supplemental dimming after play.

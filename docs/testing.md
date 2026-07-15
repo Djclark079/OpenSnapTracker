@@ -9,15 +9,10 @@ cargo test --workspace
 cargo build --workspace
 ```
 
-Frontend spike checks:
+Frontend checks:
 
 ```sh
 cd apps/electron-spike
-npm install
-npm run typecheck
-npm run build
-
-cd ../tauri-spike
 npm install
 npm run typecheck
 npm run build

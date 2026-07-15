@@ -2,7 +2,7 @@
 
 The shell decision is complete for v1: OpenSnapTracker will use Electron for the desktop shell and Rust for the core tracker engine.
 
-Tauri is retained in the repository only as comparison evidence. It should not receive further work unless a future milestone explicitly reopens the shell decision.
+Tauri source has been removed from the repository to avoid local build-output bloat. The comparison findings below are retained as documentation evidence. Tauri should not receive further work unless a future milestone explicitly reopens the shell decision.
 
 ## Decision
 

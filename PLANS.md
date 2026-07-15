@@ -11,7 +11,7 @@ Acceptance criteria:
 - State-capture utility copies changed snapshots read-only and writes a manifest.
 - SQLite migrations exist from the beginning.
 - Metadata and image-cache contracts are documented and tested.
-- Electron and Tauri spikes can be built or have precise blocker notes.
+- Electron spike can be built; Tauri has precise blocker notes retained as documentation only.
 - Electron shell decision is recorded from KDE Wayland/XWayland evidence.
 
 Progress:
@@ -25,7 +25,7 @@ Progress:
 - [x] Overlay spike behavior manually tested on KDE Wayland/XWayland.
 - [x] Shell recommendation made from prototype evidence.
 - [x] Electron selected for v1 desktop shell.
-- [x] Tauri rejected for v1 and retained as comparison evidence.
+- [x] Tauri rejected for v1; source removed to avoid local build-output bloat and comparison evidence retained in docs.
 
 ## Milestone 2: Capture Real State Fixtures
 

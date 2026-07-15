@@ -22,25 +22,21 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
-  frontend-spikes:
+  frontend:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        app: [electron-spike, tauri-spike]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: apps/${{ matrix.app }}/package-lock.json
+          cache-dependency-path: apps/electron-spike/package-lock.json
       - name: Install
-        working-directory: apps/${{ matrix.app }}
+        working-directory: apps/electron-spike
         run: npm ci
       - name: Typecheck
-        working-directory: apps/${{ matrix.app }}
+        working-directory: apps/electron-spike
         run: npm run typecheck
       - name: Build
-        working-directory: apps/${{ matrix.app }}
+        working-directory: apps/electron-spike
         run: npm run build

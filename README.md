@@ -9,7 +9,7 @@ This is not a web application and does not inject into or modify the game proces
 The repository is a foundation and technology spike, not a finished tracker. It contains:
 - Rust domain, snapshot-reader, capture, storage, metadata, and image-cache foundations.
 - An Electron overlay spike selected as the v1 desktop shell baseline.
-- A Tauri overlay spike retained as a rejected-for-v1 comparison.
+- Documentation for the removed Tauri spike retained as rejected-for-v1 comparison evidence.
 - Documentation and manual KDE Wayland/XWayland test checklists.
 
 Electron is selected for the v1 desktop shell based on KDE Wayland/XWayland spike results. Rust remains the preferred implementation language for the core tracker engine.
